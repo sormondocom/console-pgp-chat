@@ -1,7 +1,7 @@
 //! Top-level interactive menu for the demo binary.
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use std::io::{stdout, Write};
 
 use crate::{commands, ui::Ui};
@@ -106,7 +106,7 @@ fn render_menu(ui: &Ui) -> Result<()> {
 
 fn wait_for_selection() -> Result<MenuItem> {
     loop {
-        if let Event::Key(KeyEvent { code, .. }) = event::read()? {
+        if let Event::Key(KeyEvent { code, kind: KeyEventKind::Press, .. }) = event::read()? {
             let selected = match code {
                 KeyCode::Char('1') => Some(MenuItem::TerminalCapabilities),
                 KeyCode::Char('2') => Some(MenuItem::ColorTest),

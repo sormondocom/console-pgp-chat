@@ -115,7 +115,7 @@ impl Ui {
 
     /// Show a prompt and read a line of text in raw mode.
     pub fn prompt(&self, msg: &str) -> io::Result<String> {
-        use crossterm::event::{self, Event, KeyCode, KeyEvent};
+        use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 
         let mut out = stdout();
         let pal = self.renderer.palette();
@@ -132,7 +132,7 @@ impl Ui {
         let mut line = String::new();
 
         loop {
-            if let Event::Key(KeyEvent { code, modifiers, .. }) = event::read()? {
+            if let Event::Key(KeyEvent { code, modifiers, kind: KeyEventKind::Press, .. }) = event::read()? {
                 // Ctrl-C / Ctrl-D abort
                 if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
                     if matches!(code, KeyCode::Char('c') | KeyCode::Char('d')) {
@@ -174,7 +174,7 @@ impl Ui {
     /// length is visible but the content is not.  Returns a `Zeroizing<String>`
     /// so the passphrase is wiped from memory when it is dropped.
     pub fn prompt_password(&self, msg: &str) -> io::Result<zeroize::Zeroizing<String>> {
-        use crossterm::event::{self, Event, KeyCode, KeyEvent};
+        use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 
         let mut out = stdout();
         let pal = self.renderer.palette();
@@ -191,7 +191,7 @@ impl Ui {
         let mut line = zeroize::Zeroizing::new(String::new());
 
         loop {
-            if let Event::Key(KeyEvent { code, modifiers, .. }) = event::read()? {
+            if let Event::Key(KeyEvent { code, modifiers, kind: KeyEventKind::Press, .. }) = event::read()? {
                 if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
                     if matches!(code, KeyCode::Char('c') | KeyCode::Char('d')) {
                         queue!(out, ResetColor, Print("\r\n"))?;
@@ -228,7 +228,7 @@ impl Ui {
 
     /// Print a message and wait for any key before returning.
     pub fn wait_for_key(&self, msg: &str) -> io::Result<()> {
-        use crossterm::event::{self, Event};
+        use crossterm::event::{self, Event, KeyEvent, KeyEventKind};
         let mut out = stdout();
         let pal = self.renderer.palette();
 
@@ -241,7 +241,7 @@ impl Ui {
         out.flush()?;
 
         loop {
-            if let Event::Key(_) = event::read()? {
+            if let Event::Key(KeyEvent { kind: KeyEventKind::Press, .. }) = event::read()? {
                 break;
             }
         }
