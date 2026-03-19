@@ -1,0 +1,28 @@
+[package]
+name    = "pgp-chat-core"
+version.workspace     = true
+edition.workspace     = true
+rust-version.workspace = true
+license.workspace     = true
+description           = "Core library for console-pgp-chat: terminal detection, PGP crypto, P2P networking"
+
+[dependencies]
+# All pure-Rust, no native deps → builds on every Rust target tier
+tokio.workspace      = true
+futures.workspace    = true
+crossterm.workspace  = true
+pgp.workspace        = true
+rand.workspace       = true
+hex.workspace        = true
+smallvec.workspace   = true
+libp2p.workspace     = true
+serde.workspace      = true
+serde_json.workspace = true
+thiserror.workspace  = true
+tracing.workspace    = true
+chrono.workspace   = true
+uuid.workspace     = true
+zeroize.workspace  = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

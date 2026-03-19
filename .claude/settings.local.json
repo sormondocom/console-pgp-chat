@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo search:*)",
+      "Bash(curl -s https://crates.io/api/v1/crates/pgp)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); versions=[v[''''num''''] for v in d.get\\(''''versions'''',[]\\)[:10]]; print\\(versions\\)\")",
+      "Bash(curl -s https://raw.githubusercontent.com/nicowillis/supports-color/main/src/lib.rs)",
+      "Bash(curl -s https://docs.rs/supports-color/3.0.2/supports_color/)",
+      "Bash(curl -s https://raw.githubusercontent.com/rpgp/rpgp/master/src/composed/key/builder.rs)",
+      "Bash(curl -s https://raw.githubusercontent.com/rpgp/rpgp/master/src/composed/message/builder.rs)",
+      "Bash(curl -s https://raw.githubusercontent.com/rpgp/rpgp/master/src/composed/message/mod.rs)",
+      "Bash(git config:*)",
+      "Bash(cargo check:*)",
+      "Bash(python -c \"import sys,json; m=json.load\\(sys.stdin\\); [print\\(p[''''name''''],p[''''version'''']\\) for p in m[''''packages''''] if p[''''name''''] in \\(''''pgp'''',''''libp2p''''\\)]\")",
+      "Bash(find /c/Users/Shawn/.cargo/registry/src -path */pgp-0.13.2/src* -name *.rs)",
+      "Bash(cargo test:*)",
+      "Bash(grep -r \"encrypt_with_password\\\\|decrypt_with_password\\\\|symmetric\\\\|SymmetricKey\\\\|S2k\\\\|StringToKey\\\\|new_literal\" --include=*.rs .)",
+      "Bash(cargo doc:*)",
+      "Read(//c/Users/Shawn/.cargo/registry/src/**)",
+      "Bash(cargo build:*)"
+    ]
+  }
+}

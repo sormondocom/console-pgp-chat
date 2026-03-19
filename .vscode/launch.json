@@ -1,0 +1,83 @@
+{
+    // VS Code launch configurations for console-pgp-chat.
+    // Requires the "rust-analyzer" and "CodeLLDB" (or "ms-vscode.cpptools")
+    // extensions to be installed.
+    "version": "0.2.0",
+    "configurations": [
+        // ── Interactive demo (default) ────────────────────────────────────────
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Run pgp-chat-demo",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin", "pgp-chat-demo",
+                    "--manifest-path", "${workspaceFolder}/Cargo.toml"
+                ],
+                "filter": {
+                    "name": "pgp-chat-demo",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            // Show tracing output in the Debug Console.
+            "env": {
+                "RUST_LOG": "info",
+                "RUST_BACKTRACE": "1"
+            },
+            // Use an integrated terminal so raw-mode / crossterm work correctly.
+            "terminal": "integrated"
+        },
+
+        // ── Demo with verbose libp2p logging ──────────────────────────────────
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Run pgp-chat-demo (debug logging)",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin", "pgp-chat-demo",
+                    "--manifest-path", "${workspaceFolder}/Cargo.toml"
+                ],
+                "filter": {
+                    "name": "pgp-chat-demo",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_LOG": "debug,libp2p_gossipsub=debug,libp2p_kad=debug",
+                "RUST_BACKTRACE": "full"
+            },
+            "terminal": "integrated"
+        },
+
+        // ── Unit tests — pgp-chat-core ────────────────────────────────────────
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Test pgp-chat-core",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package", "pgp-chat-core",
+                    "--manifest-path", "${workspaceFolder}/Cargo.toml",
+                    "--no-run"
+                ],
+                "filter": {
+                    "name": "pgp_chat_core",
+                    "kind": "lib"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_BACKTRACE": "1"
+            }
+        }
+    ]
+}
