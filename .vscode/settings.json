@@ -1,0 +1,31 @@
+{
+    // ── Rust / rust-analyzer ─────────────────────────────────────────────────
+    "rust-analyzer.cargo.target": "x86_64-pc-windows-msvc",
+
+    // Use cargo's own check on save rather than the slower full build.
+    "rust-analyzer.checkOnSave": true,
+    "rust-analyzer.check.command": "clippy",
+
+    // Proc-macro server lives next to the compiled output.
+    "rust-analyzer.procMacro.enable": true,
+
+    // ── Editor ───────────────────────────────────────────────────────────────
+    "[rust]": {
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "rust-lang.rust-analyzer"
+    },
+
+    // ── Debugger (CodeLLDB — LLVM LLDB) ─────────────────────────────────────
+    // CodeLLDB on Windows understands PDB symbols produced by the MSVC linker
+    // as well as DWARF produced by clang-cl. No extra configuration needed —
+    // the launch.json type "lldb" picks this up automatically.
+    "lldb.adapterType": "bundled",
+
+    // ── Files ────────────────────────────────────────────────────────────────
+    "files.watcherExclude": {
+        "**/target/**": true
+    },
+    "search.exclude": {
+        "**/target": true
+    }
+}

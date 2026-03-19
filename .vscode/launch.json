@@ -1,83 +1,57 @@
 {
     // VS Code launch configurations for console-pgp-chat.
-    // Requires the "rust-analyzer" and "CodeLLDB" (or "ms-vscode.cpptools")
-    // extensions to be installed.
+    // Debugger: cppvsdbg (ms-vscode.cpptools) — MSVC Visual Studio debugger.
+    // Build is handled by the preLaunchTask before each debug session starts.
     "version": "0.2.0",
     "configurations": [
         // ── Interactive demo (default) ────────────────────────────────────────
         {
-            "type": "lldb",
+            "type": "cppvsdbg",
             "request": "launch",
             "name": "Run pgp-chat-demo",
-            "cargo": {
-                "args": [
-                    "build",
-                    "--bin", "pgp-chat-demo",
-                    "--manifest-path", "${workspaceFolder}/Cargo.toml"
-                ],
-                "filter": {
-                    "name": "pgp-chat-demo",
-                    "kind": "bin"
-                }
-            },
+            "program": "${workspaceFolder}/target/debug/pgp-chat-demo.exe",
             "args": [],
+            "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
-            // Show tracing output in the Debug Console.
-            "env": {
-                "RUST_LOG": "info",
-                "RUST_BACKTRACE": "1"
-            },
-            // Use an integrated terminal so raw-mode / crossterm work correctly.
-            "terminal": "integrated"
+            "environment": [
+                { "name": "RUST_LOG",      "value": "info" },
+                { "name": "RUST_BACKTRACE","value": "1" }
+            ],
+            "console": "integratedTerminal",
+            "preLaunchTask": "cargo build pgp-chat-demo (debug)"
         },
 
         // ── Demo with verbose libp2p logging ──────────────────────────────────
         {
-            "type": "lldb",
+            "type": "cppvsdbg",
             "request": "launch",
             "name": "Run pgp-chat-demo (debug logging)",
-            "cargo": {
-                "args": [
-                    "build",
-                    "--bin", "pgp-chat-demo",
-                    "--manifest-path", "${workspaceFolder}/Cargo.toml"
-                ],
-                "filter": {
-                    "name": "pgp-chat-demo",
-                    "kind": "bin"
-                }
-            },
+            "program": "${workspaceFolder}/target/debug/pgp-chat-demo.exe",
             "args": [],
+            "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
-            "env": {
-                "RUST_LOG": "debug,libp2p_gossipsub=debug,libp2p_kad=debug",
-                "RUST_BACKTRACE": "full"
-            },
-            "terminal": "integrated"
+            "environment": [
+                { "name": "RUST_LOG",      "value": "debug,libp2p_gossipsub=debug,libp2p_kad=debug" },
+                { "name": "RUST_BACKTRACE","value": "full" }
+            ],
+            "console": "integratedTerminal",
+            "preLaunchTask": "cargo build pgp-chat-demo (debug)"
         },
 
         // ── Unit tests — pgp-chat-core ────────────────────────────────────────
         {
-            "type": "lldb",
+            "type": "cppvsdbg",
             "request": "launch",
             "name": "Test pgp-chat-core",
-            "cargo": {
-                "args": [
-                    "test",
-                    "--package", "pgp-chat-core",
-                    "--manifest-path", "${workspaceFolder}/Cargo.toml",
-                    "--no-run"
-                ],
-                "filter": {
-                    "name": "pgp_chat_core",
-                    "kind": "lib"
-                }
-            },
+            "program": "${workspaceFolder}/target/debug/deps/pgp_chat_core.exe",
             "args": [],
+            "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
-            "env": {
-                "RUST_BACKTRACE": "1"
-            }
+            "environment": [
+                { "name": "RUST_BACKTRACE","value": "1" }
+            ],
+            "console": "internalConsole",
+            "preLaunchTask": "cargo test pgp-chat-core (no-run)"
         }
     ]
 }

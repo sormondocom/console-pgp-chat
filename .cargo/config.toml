@@ -1,0 +1,9 @@
+# Cargo configuration for console-pgp-chat
+# Target: x86_64-pc-windows-msvc  (LLVM toolchain)
+
+[target.x86_64-pc-windows-msvc]
+# lld-link is LLVM's MSVC-compatible linker.
+# Install via: rustup component add llvm-tools
+# or ship with a clang/LLVM installation (lld-link.exe on PATH).
+linker = "lld-link"
+rustflags = ["-C", "linker-flavor=msvc"]

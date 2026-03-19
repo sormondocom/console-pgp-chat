@@ -1,0 +1,41 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cargo build (debug)",
+            "type": "shell",
+            "command": "cargo",
+            "args": ["build", "--manifest-path", "${workspaceFolder}/Cargo.toml"],
+            "group": { "kind": "build", "isDefault": true },
+            "presentation": { "reveal": "silent", "panel": "shared" },
+            "problemMatcher": "$rustc"
+        },
+        {
+            "label": "cargo build pgp-chat-demo (debug)",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "build",
+                "--bin", "pgp-chat-demo",
+                "--manifest-path", "${workspaceFolder}/Cargo.toml"
+            ],
+            "group": "build",
+            "presentation": { "reveal": "silent", "panel": "shared" },
+            "problemMatcher": "$rustc"
+        },
+        {
+            "label": "cargo test pgp-chat-core (no-run)",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "test",
+                "--package", "pgp-chat-core",
+                "--manifest-path", "${workspaceFolder}/Cargo.toml",
+                "--no-run"
+            ],
+            "group": "test",
+            "presentation": { "reveal": "silent", "panel": "shared" },
+            "problemMatcher": "$rustc"
+        }
+    ]
+}
