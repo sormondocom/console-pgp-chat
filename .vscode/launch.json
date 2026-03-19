@@ -1,7 +1,8 @@
 {
     // VS Code launch configurations for console-pgp-chat.
     // Debugger: cppvsdbg (ms-vscode.cpptools) — MSVC Visual Studio debugger.
-    // Build is handled by the preLaunchTask before each debug session starts.
+    // NOTE: CARGO_TARGET_DIR=D:\rust\cargo is set in the system environment,
+    //       so binaries land in D:\rust\cargo\debug\ rather than target\debug\.
     "version": "0.2.0",
     "configurations": [
         // ── Interactive demo (default) ────────────────────────────────────────
@@ -9,7 +10,7 @@
             "type": "cppvsdbg",
             "request": "launch",
             "name": "Run pgp-chat-demo",
-            "program": "${workspaceFolder}/target/debug/pgp-chat-demo.exe",
+            "program": "D:/rust/cargo/debug/pgp-chat-demo.exe",
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
@@ -17,7 +18,7 @@
                 { "name": "RUST_LOG",      "value": "info" },
                 { "name": "RUST_BACKTRACE","value": "1" }
             ],
-            "console": "integratedTerminal",
+            "console": "externalTerminal",
             "preLaunchTask": "cargo build pgp-chat-demo (debug)"
         },
 
@@ -26,7 +27,7 @@
             "type": "cppvsdbg",
             "request": "launch",
             "name": "Run pgp-chat-demo (debug logging)",
-            "program": "${workspaceFolder}/target/debug/pgp-chat-demo.exe",
+            "program": "D:/rust/cargo/debug/pgp-chat-demo.exe",
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
@@ -34,7 +35,7 @@
                 { "name": "RUST_LOG",      "value": "debug,libp2p_gossipsub=debug,libp2p_kad=debug" },
                 { "name": "RUST_BACKTRACE","value": "full" }
             ],
-            "console": "integratedTerminal",
+            "console": "externalTerminal",
             "preLaunchTask": "cargo build pgp-chat-demo (debug)"
         },
 
@@ -43,7 +44,7 @@
             "type": "cppvsdbg",
             "request": "launch",
             "name": "Test pgp-chat-core",
-            "program": "${workspaceFolder}/target/debug/deps/pgp_chat_core.exe",
+            "program": "D:/rust/cargo/debug/deps/pgp_chat_core.exe",
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",

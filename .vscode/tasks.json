@@ -7,8 +7,9 @@
             "command": "cargo",
             "args": ["build", "--manifest-path", "${workspaceFolder}/Cargo.toml"],
             "group": { "kind": "build", "isDefault": true },
-            "presentation": { "reveal": "silent", "panel": "shared" },
-            "problemMatcher": "$rustc"
+            "presentation": { "reveal": "always", "panel": "shared", "close": false },
+            "problemMatcher": "$rustc",
+            "options": { "cwd": "${workspaceFolder}" }
         },
         {
             "label": "cargo build pgp-chat-demo (debug)",
@@ -20,8 +21,9 @@
                 "--manifest-path", "${workspaceFolder}/Cargo.toml"
             ],
             "group": "build",
-            "presentation": { "reveal": "silent", "panel": "shared" },
-            "problemMatcher": "$rustc"
+            "presentation": { "reveal": "always", "panel": "shared", "close": false },
+            "problemMatcher": "$rustc",
+            "options": { "cwd": "${workspaceFolder}" }
         },
         {
             "label": "cargo test pgp-chat-core (no-run)",
@@ -34,8 +36,9 @@
                 "--no-run"
             ],
             "group": "test",
-            "presentation": { "reveal": "silent", "panel": "shared" },
-            "problemMatcher": "$rustc"
+            "presentation": { "reveal": "always", "panel": "shared", "close": false },
+            "problemMatcher": "$rustc",
+            "options": { "cwd": "${workspaceFolder}" }
         }
     ]
 }

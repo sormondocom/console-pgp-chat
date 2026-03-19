@@ -20,7 +20,7 @@
 //! | Ctrl-C/D  | Quit                                          |
 
 use anyhow::{Context, Result};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 use libp2p::identity::Keypair;
 use std::io::{stdout, Write};
@@ -81,7 +81,7 @@ pub async fn run(ui: &Ui) -> Result<()> {
     stdout().flush()?;
 
     let pgp_identity = loop {
-        if let crossterm::event::Event::Key(crossterm::event::KeyEvent { code, .. }) =
+        if let crossterm::event::Event::Key(crossterm::event::KeyEvent { code, kind: KeyEventKind::Press, .. }) =
             crossterm::event::read()?
         {
             match code {
@@ -346,7 +346,7 @@ pub async fn run(ui: &Ui) -> Result<()> {
             // ── Keyboard input ─────────────────────────────────────────────
             term_evt = event_stream.next() => {
                 match term_evt {
-                    Some(Ok(Event::Key(KeyEvent { code, modifiers, .. }))) => {
+                    Some(Ok(Event::Key(KeyEvent { code, modifiers, kind: KeyEventKind::Press, .. }))) => {
                         // Ctrl-C or Ctrl-D to leave
                         if modifiers.contains(KeyModifiers::CONTROL)
                             && matches!(code, KeyCode::Char('c') | KeyCode::Char('d'))
@@ -486,7 +486,7 @@ pub async fn run(ui: &Ui) -> Result<()> {
                                 let mut confirm_buf = String::new();
                                 loop {
                                     if let crossterm::event::Event::Key(
-                                        crossterm::event::KeyEvent { code: kc, .. }
+                                        crossterm::event::KeyEvent { code: kc, kind: KeyEventKind::Press, .. }
                                     ) = crossterm::event::read()? {
                                         match kc {
                                             KeyCode::Esc => {
