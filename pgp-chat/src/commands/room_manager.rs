@@ -18,7 +18,7 @@ pub fn run(ui: &Ui, storage_dir: &Path) -> Result<()> {
         ui.renderer.draw_box_top("Manage Rooms")?;
 
         if rooms.is_empty() {
-            println!("  No rooms saved yet.  Use [n] to add one.\r");
+            println!("  No rooms saved yet.  Use [c] to add one.\r");
         } else {
             println!("  {:<3}  {:<26}  {}\r", "#", "Room Name", "Role");
             ui.renderer.draw_box_separator()?;
@@ -26,13 +26,14 @@ pub fn run(ui: &Ui, storage_dir: &Path) -> Result<()> {
                 let role = if r.is_owner { "owner" } else { "member" };
                 println!("  [{:<2}]  {:<26}  {}\r", i + 1, r.name, role);
             }
+            println!("\r");
+            println!("  Enter a number to view / edit details\r");
         }
 
         ui.renderer.draw_box_separator()?;
         println!("  [c] Create Room   (set or generate a passphrase — you become the owner)\r");
         println!("  [j] Join Room     (enter a passphrase someone shared with you)\r");
         if !rooms.is_empty() {
-            println!("  Enter a number to view / edit details\r");
             println!("  [f] Forget a room\r");
         }
         println!("  [0] Back\r");
