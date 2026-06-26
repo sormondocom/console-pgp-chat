@@ -8,8 +8,9 @@ use crossterm::{
     style::{Attribute, Print, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{Clear, ClearType},
 };
-use pgp_chat_core::terminal::{
-    capability::TerminalCapability, renderer::Renderer,
+use pgp_chat_core::{
+    persistence::AppConfig,
+    terminal::{capability::TerminalCapability, renderer::Renderer},
 };
 use std::io::{self, stdout, Write};
 
@@ -23,10 +24,10 @@ pub struct Ui {
 }
 
 impl Ui {
-    /// Detect the current terminal and build a `Ui`.
-    pub fn new() -> Self {
+    /// Build a `Ui` with chat colors driven by the active theme in `config`.
+    pub fn from_config(config: &AppConfig) -> Self {
         let cap = TerminalCapability::detect();
-        Self { renderer: Renderer::new(cap) }
+        Self { renderer: Renderer::with_theme(cap, &config.chat_theme) }
     }
 
     // -----------------------------------------------------------------------
@@ -40,12 +41,12 @@ impl Ui {
 
     /// Print the application banner with capability info in the header.
     ///
-    /// Example (true-colour Unicode terminal):
+    /// Example (true-color Unicode terminal):
     /// ```text
     /// ╔══ Console PGP Chat ══╗
     /// ║  P2P Encrypted Chat  ║
     /// ╠══════════════════════╣
-    /// ║  xterm-256color (256 colours, Unicode) │ 220×50  ║
+    /// ║  xterm-256color (256 colors, Unicode) │ 220×50  ║
     /// ╚══════════════════════╝
     /// ```
     pub fn print_banner(&self) -> io::Result<()> {
@@ -65,7 +66,7 @@ impl Ui {
             SetAttribute(Attribute::Bold),
             Print(format!(
                 "  {:<width$}",
-                "P2P · End-to-End Encrypted · PGP Authenticated",
+                "PGP Chat · End-to-End Encrypted · PGP Authenticated",
                 width = cap.width.saturating_sub(4) as usize
             )),
             SetAttribute(Attribute::Reset),
@@ -78,27 +79,22 @@ impl Ui {
 
         self.renderer.draw_box_separator()?;
 
-        // Capability info row
+        // Capability info row — measure by char count (not bytes) so that
+        // multi-byte Unicode chars like │ (3 bytes) and × (2 bytes) are each
+        // counted as the 1 terminal column they actually occupy.
+        let info_str = format!("  {}  │  {}×{}", cap.summary(), cap.width, cap.height);
+        let info_cols = info_str.chars().count();
+        let inner_width = cap.width.saturating_sub(2) as usize; // minus left and right border
+        let pad = inner_width.saturating_sub(info_cols);
         queue!(
             out,
             SetForegroundColor(pal.border),
             Print(self.renderer_border_v()),
             ResetColor,
             SetForegroundColor(pal.dim),
-            Print(format!(
-                "  {}  │  {}×{}",
-                cap.summary(),
-                cap.width,
-                cap.height
-            )),
-            ResetColor,
-        )?;
-        // Pad to width
-        let info_len = cap.summary().len() + format!("  │  {}×{}", cap.width, cap.height).len() + 4;
-        let pad = cap.width.saturating_sub(info_len as u16 + 2) as usize;
-        queue!(
-            out,
+            Print(&info_str),
             Print(" ".repeat(pad)),
+            ResetColor,
             SetForegroundColor(pal.border),
             Print(self.renderer_border_v()),
             Print("\r\n"),
@@ -112,6 +108,22 @@ impl Ui {
     // -----------------------------------------------------------------------
     // Input
     // -----------------------------------------------------------------------
+
+    /// Print the prompt label in accent color without reading input.
+    ///
+    /// Use this on menus that read a single keypress through a separate handler
+    /// so that the visual style matches `prompt()` on all other screens.
+    pub fn print_prompt_label(&self, msg: &str) -> io::Result<()> {
+        let mut out = stdout();
+        let pal = self.renderer.palette();
+        queue!(
+            out,
+            SetForegroundColor(pal.accent),
+            Print(format!("  {} ", msg)),
+            ResetColor,
+        )?;
+        out.flush()
+    }
 
     /// Show a prompt and read a line of text in raw mode.
     pub fn prompt(&self, msg: &str) -> io::Result<String> {
@@ -143,6 +155,11 @@ impl Ui {
                 }
                 match code {
                     KeyCode::Enter => break,
+                    KeyCode::Esc => {
+                        queue!(out, ResetColor, Print("\r\n"))?;
+                        out.flush()?;
+                        return Ok(String::new());
+                    }
                     KeyCode::Char(c) => {
                         line.push(c);
                         queue!(out, Print(c))?;
@@ -201,6 +218,11 @@ impl Ui {
                 }
                 match code {
                     KeyCode::Enter => break,
+                    KeyCode::Esc => {
+                        queue!(out, ResetColor, Print("\r\n"))?;
+                        out.flush()?;
+                        return Ok(zeroize::Zeroizing::new(String::new()));
+                    }
                     KeyCode::Char(c) => {
                         line.push(c);
                         queue!(out, Print('*'))?;
@@ -278,6 +300,109 @@ impl Ui {
             ResetColor,
         )?;
         out.flush()
+    }
+
+    /// Render the lock mascot as content rows inside the currently-open box.
+    ///
+    /// All mascot lines are pre-padded to the same width so they centre
+    /// at a consistent horizontal offset regardless of terminal width.
+    /// The shackle legs (col 2 & 8) align with the body connectors (+) on
+    /// the top row of the body.
+    pub fn print_mascot(&self) -> io::Result<()> {
+        let mut out = stdout();
+        let pal = self.renderer.palette();
+        let inner = self.renderer.cap().width.saturating_sub(2) as usize;
+
+        // Scene: two CRT desktops flanking a bidirectional encrypted channel.
+        //
+        // Each computer column is 11 chars wide.  Between them: 4-char gap,
+        // 15-char arrow region, 4-char gap.  Total per row: 45 chars.
+        //
+        // Computers (11 chars each):
+        //   .---------.   monitor top / bottom corners
+        //   | .-----. |   CRT bezel
+        //   | |     | |   screen inner
+        //   '---------'   monitor base edge
+        //       |   |     stand legs (cols 4 & 8 of the 11-char block)
+        //    .-------.    desk base
+        //    |_______|
+        //
+        // Left screen shows padlock (local identity locked).
+        // Right screen shows data lines (peer terminal activity).
+        // A padlock hangs in the centre column below the arrow:
+        //
+        //   centre col (15 chars), rows 4-8:
+        //     row 4 — shackle top :  "     .---.     "  (legs at cols 5 & 9)
+        //     row 5 — shackle legs:  "     |   |     "  (legs at cols 5 & 9)
+        //     row 6 — body top    :  "   .-------.   "  (corners at cols 3 & 11)
+        //     row 7 — keyhole     :  "   |  (o)  |   "
+        //     row 8 — body bottom :  "   |_______|   "
+        //
+        //   Shackle legs (5, 9) fall inside the body span (3–11), so the shackle
+        //   appears to insert through the top face of the body — correct padlock form.
+        let blank    = "               ";  // 15 spaces
+        let gap      = "    ";             // 4-space gap on each side of the centre
+        let arrow    = "<~~~~~~~~~~~~~>"; // 15 chars, bidirectional channel
+        let lk_sh_t  = "     .---.     ";  // 15: shackle top  (.---. at cols 5-9)
+        let lk_sh_s  = "     |   |     ";  // 15: shackle sides
+        let lk_bd_t  = "   .-------.   ";  // 15: body top     (.-------.at cols 3-11)
+        let lk_bd_m  = "   |  (o)  |   ";  // 15: body keyhole
+        let lk_bd_b  = "   |_______|   ";  // 15: body bottom
+
+        let rows: Vec<String> = vec![
+            String::new(),
+            format!(".---------.{gap}{blank}{gap}.---------."),
+            format!("| .-----. |{gap}{blank}{gap}| .-----. |"),
+            format!("| | (o) | |{gap}{arrow}{gap}| | === | |"),
+            format!("| |  |  | |{gap}{lk_sh_t}{gap}| | --- | |"),
+            format!("| '-----' |{gap}{lk_sh_s}{gap}| '-----' |"),
+            format!("'---------'{gap}{lk_bd_t}{gap}'---------'"),
+            format!("    |   |  {gap}{lk_bd_m}{gap}    |   |  "),
+            format!(" .-------. {gap}{lk_bd_b}{gap} .-------. "),
+            format!(" |_______| {gap}{blank}{gap} |_______| "),
+            String::new(),
+        ];
+
+        for row in &rows {
+            let len = row.chars().count();
+            let pad_left  = inner.saturating_sub(len) / 2;
+            let pad_right = inner.saturating_sub(len + pad_left);
+            queue!(
+                out,
+                SetForegroundColor(pal.border),
+                Print(self.renderer_border_v()),
+                ResetColor,
+                SetForegroundColor(pal.accent),
+                Print(" ".repeat(pad_left)),
+                Print(row.as_str()),
+                Print(" ".repeat(pad_right)),
+                ResetColor,
+                SetForegroundColor(pal.border),
+                Print(self.renderer_border_v()),
+                Print("\r\n"),
+                ResetColor,
+            )?;
+        }
+        out.flush()
+    }
+
+    /// Print a labelled passphrase box for easy copying / sharing.
+    ///
+    /// The box is sized to whichever is wider: the label row or the passphrase
+    /// row.  Both label and passphrase should be ASCII so `.len()` equals the
+    /// display column count.
+    pub fn show_passphrase_box(&self, label: &str, passphrase: &str) {
+        let inner_w = std::cmp::max(
+            label.len() + 6,
+            passphrase.len() + 4,
+        );
+        let top_prefix = format!("══ {} ", label);
+        let top_fill   = "═".repeat(inner_w - top_prefix.chars().count());
+        println!("  ╔{}{}╗\r", top_prefix, top_fill);
+        let mid     = format!("  {}  ", passphrase);
+        let mid_pad = " ".repeat(inner_w - mid.len());
+        println!("  ║{}{}║\r", mid, mid_pad);
+        println!("  ╚{}╝\r", "═".repeat(inner_w));
     }
 
     /// Print a plain info line.

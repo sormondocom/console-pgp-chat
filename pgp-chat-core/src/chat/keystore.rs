@@ -29,6 +29,12 @@ use crate::chat::trust::TrustState;
 // Storage types
 // ---------------------------------------------------------------------------
 
+/// A trusted peer: key material + display nickname (both needed for export).
+struct TrustedEntry {
+    key:  SignedPublicKey,
+    nick: String,
+}
+
 /// Metadata stored alongside a key in the pending / deferred bucket.
 #[derive(Clone)]
 struct PendingEntry {
@@ -42,7 +48,7 @@ struct PendingEntry {
 #[derive(Default)]
 pub struct PeerKeyStore {
     /// Explicitly approved keys — used for encryption and signature verification.
-    trusted:  HashMap<String, SignedPublicKey>,
+    trusted:  HashMap<String, TrustedEntry>,
     /// Keys received while normal mode is active; awaiting user approval.
     pending:  HashMap<String, PendingEntry>,
     /// Keys received while deferring mode is active; promoted to pending on exit.
@@ -96,6 +102,15 @@ impl PeerKeyStore {
         true
     }
 
+    /// Import a key directly into the trusted bucket without user approval.
+    ///
+    /// Used when loading persisted contacts on startup — these were already
+    /// approved in a previous session.  The `peer_map` entry is populated
+    /// later when the peer reconnects and sends `AnnounceKey`.
+    pub fn import_trusted(&mut self, fingerprint: String, key: SignedPublicKey, nick: String) {
+        self.trusted.insert(fingerprint, TrustedEntry { key, nick });
+    }
+
     // -----------------------------------------------------------------------
     // Trust management
     // -----------------------------------------------------------------------
@@ -109,7 +124,7 @@ impl PeerKeyStore {
             .or_else(|| self.deferred.remove(fingerprint))?;
         let nick = entry.nick.clone();
         self.peer_map.insert(entry.peer_id, fingerprint.to_string());
-        self.trusted.insert(fingerprint.to_string(), entry.key);
+        self.trusted.insert(fingerprint.to_string(), TrustedEntry { key: entry.key, nick: nick.clone() });
         Some(nick)
     }
 
@@ -174,7 +189,12 @@ impl PeerKeyStore {
 
     /// Look up a *trusted* key by fingerprint.
     pub fn get_by_fingerprint(&self, fp: &str) -> Option<&SignedPublicKey> {
-        self.trusted.get(fp)
+        self.trusted.get(fp).map(|e| &e.key)
+    }
+
+    /// Display nickname stored for a trusted fingerprint.
+    pub fn trusted_nick(&self, fp: &str) -> Option<&str> {
+        self.trusted.get(fp).map(|e| e.nick.as_str())
     }
 
     /// Look up a *trusted* key by libp2p `PeerId`.
@@ -182,6 +202,7 @@ impl PeerKeyStore {
         self.peer_map
             .get(peer_id)
             .and_then(|fp| self.trusted.get(fp))
+            .map(|e| &e.key)
     }
 
     /// Fingerprint of a trusted peer, if known.
@@ -191,7 +212,7 @@ impl PeerKeyStore {
 
     /// All *trusted* public keys (for multi-recipient encryption).
     pub fn all_public_keys(&self) -> Vec<&SignedPublicKey> {
-        self.trusted.values().collect()
+        self.trusted.values().map(|e| &e.key).collect()
     }
 
     /// All *trusted* fingerprints (for building the recipient list).
@@ -215,6 +236,21 @@ impl PeerKeyStore {
             .collect()
     }
 
+    /// All trusted entries as `(fingerprint, nickname, key)` triples.
+    ///
+    /// Used by the persistence layer to serialise the trust store on exit.
+    pub fn export_trusted(&self) -> Vec<(String, String, &SignedPublicKey)> {
+        self.trusted
+            .iter()
+            .map(|(fp, e)| (fp.clone(), e.nick.clone(), &e.key))
+            .collect()
+    }
+
+    /// All rejected fingerprints.
+    pub fn rejected_fingerprints(&self) -> Vec<String> {
+        self.rejected.iter().cloned().collect()
+    }
+
     /// Number of trusted peers.
     pub fn len(&self) -> usize {
         self.trusted.len()
@@ -222,6 +258,21 @@ impl PeerKeyStore {
 
     pub fn is_empty(&self) -> bool {
         self.trusted.is_empty()
+    }
+
+    // -----------------------------------------------------------------------
+    // Peer-map maintenance
+    // -----------------------------------------------------------------------
+
+    /// Update the PeerId → fingerprint mapping for a trusted peer.
+    ///
+    /// Called when a previously-trusted peer reconnects with a new ephemeral
+    /// libp2p identity.  This keeps `get_by_peer()` accurate without
+    /// requiring the user to re-approve the key.
+    pub fn update_peer_mapping(&mut self, peer_id: PeerId, fingerprint: &str) {
+        if self.trusted.contains_key(fingerprint) {
+            self.peer_map.insert(peer_id, fingerprint.to_string());
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -240,7 +291,6 @@ impl PeerKeyStore {
         self.trusted.remove(fp);
         self.pending.remove(fp);
         self.deferred.remove(fp);
-        // Clean up reverse mapping
         self.peer_map.retain(|_, v| v != fp);
     }
 

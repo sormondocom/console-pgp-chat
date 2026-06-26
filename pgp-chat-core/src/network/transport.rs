@@ -21,6 +21,7 @@
 
 use std::time::Duration;
 
+use sha2::{Sha256, Digest};
 use libp2p::{
     gossipsub, identify, kad, noise, tcp, yamux,
     identity::Keypair,
@@ -67,14 +68,15 @@ pub fn build_swarm(keypair: Keypair) -> Result<Swarm<ChatBehaviour>> {
     // encrypted, so we can no longer peek at the inner SignedChatMessage.
     // Hash the raw ciphertext bytes for gossipsub-level dedup.
     // Application-layer dedup still uses the inner UUID via seen_messages.
+    // Message IDs use the first 20 bytes of SHA-256 over the ciphertext.
+    // This is collision-resistant (2^80 birthday bound) so a room participant
+    // cannot craft a second message that suppresses a valid one via dedup.
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(GOSSIPSUB_HEARTBEAT)
         .validation_mode(gossipsub::ValidationMode::Strict)
         .message_id_fn(|msg: &gossipsub::Message| {
-            use std::hash::{Hash, Hasher};
-            let mut s = std::collections::hash_map::DefaultHasher::new();
-            msg.data.hash(&mut s);
-            gossipsub::MessageId::new(&s.finish().to_be_bytes())
+            let hash = Sha256::digest(&msg.data);
+            gossipsub::MessageId::new(&hash[..20])
         })
         .build()
         .map_err(|e| Error::Network(e.to_string()))?;

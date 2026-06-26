@@ -14,11 +14,16 @@ pub enum ChatNetEvent {
     /// A complete (possibly encrypted) chat payload was received.
     MessageReceived {
         /// libp2p identity of the sender.
-        from:    PeerId,
+        from:     PeerId,
         /// Gossipsub topic name (= room name hash).
-        topic:   String,
+        topic:    String,
         /// Raw serialised `SignedChatMessage` bytes (already room-decrypted).
-        payload: Vec<u8>,
+        payload:  Vec<u8>,
+        /// `true` when the detached EdDSA signature in `payload` was verified
+        /// against a key in the trusted keystore.  `false` for messages from
+        /// peers whose key has not been approved yet, or whose signature did
+        /// not match.  The UI MUST display a warning for unverified senders.
+        verified: bool,
     },
 
     /// Kademlia or Gossipsub found a new peer.

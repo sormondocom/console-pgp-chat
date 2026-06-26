@@ -2624,8 +2624,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgp-chat"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "crossterm",
+ "futures",
+ "hex",
+ "libp2p",
+ "pgp-chat-core",
+ "rand 0.8.5",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "pgp-chat-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "crossterm",
@@ -2636,29 +2655,11 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde_json",
+ "sha2",
  "smallvec",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "pgp-chat-demo"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "crossterm",
- "futures",
- "libp2p",
- "pgp",
- "pgp-chat-core",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
  "uuid",
  "zeroize",
 ]

@@ -42,13 +42,19 @@ pub enum MessageKind {
 
     /// PGP-encrypted ciphertext.
     ///
-    /// The `ciphertext` bytes were produced by encrypting to all `recipients`
-    /// public keys simultaneously (standard PGP multi-recipient encryption).
+    /// The ciphertext bytes were produced by encrypting to all trusted peers'
+    /// public keys simultaneously (standard PGP multi-recipient PKESK).
+    /// We intentionally do NOT include the recipient fingerprints on the wire:
+    /// that list would leak the sender's trusted social graph to every room
+    /// member who holds the room passphrase, including unapproved peers.
+    /// PGP stores a PKESK (Public Key Encrypted Session Key) per recipient
+    /// inside the ciphertext itself — no external list is required for
+    /// decryption.  Only the count is kept for display purposes.
     Encrypted {
         /// Raw PGP packet bytes (binary, not armoured).
         ciphertext: Vec<u8>,
-        /// Fingerprints of all intended recipients.
-        recipients: Vec<String>,
+        /// Number of recipients encrypted to (display only, not used for decryption).
+        recipient_count: usize,
     },
 
     /// Peer is announcing their long-term PGP public key to the room.
@@ -149,7 +155,7 @@ impl ChatMessage {
         sender_fp: &str,
         sender_nick: &str,
         ciphertext: Vec<u8>,
-        recipients: Vec<String>,
+        recipient_count: usize,
     ) -> Self {
         Self {
             id:          Uuid::new_v4(),
@@ -157,7 +163,7 @@ impl ChatMessage {
             sender_fp:   sender_fp.to_string(),
             sender_nick: sender_nick.to_string(),
             timestamp:   Utc::now(),
-            kind:        MessageKind::Encrypted { ciphertext, recipients },
+            kind:        MessageKind::Encrypted { ciphertext, recipient_count },
         }
     }
 

@@ -13,25 +13,25 @@ use std::env;
 // Public types
 // ---------------------------------------------------------------------------
 
-/// How many colours the terminal can display.
+/// How many colors the terminal can display.
 ///
 /// Ordered so that `a > b` means "richer capabilities than b".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ColorDepth {
-    /// No colour support — VT-100 / `dumb` / `NO_COLOR` set.
+    /// No color support — VT-100 / `dumb` / `NO_COLOR` set.
     Monochrome,
-    /// 16 basic ANSI named colours (8 standard + 8 bright).
+    /// 16 basic ANSI named colors (8 standard + 8 bright).
     Ansi16,
-    /// 256-colour xterm/vte palette.
+    /// 256-color xterm/vte palette.
     Ansi256,
-    /// 24-bit true colour (16.7 M colours).
+    /// 24-bit true color (16.7 M colors).
     TrueColor,
 }
 
 /// Detected capabilities of the running terminal.
 #[derive(Debug, Clone)]
 pub struct TerminalCapability {
-    /// Maximum colour depth we can rely on.
+    /// Maximum color depth we can rely on.
     pub color_depth: ColorDepth,
     /// Whether box-drawing / Unicode characters are safe to emit.
     pub unicode: bool,
@@ -66,13 +66,13 @@ impl TerminalCapability {
         Self { color_depth, unicode, width, height, term_name }
     }
 
-    /// Human-readable summary, e.g. `"xterm-256color (256 colours, Unicode)"`.
+    /// Human-readable summary, e.g. `"xterm-256color (256 colors, Unicode)"`.
     pub fn summary(&self) -> String {
         let color_label = match self.color_depth {
             ColorDepth::Monochrome => "monochrome",
-            ColorDepth::Ansi16    => "16 colours",
-            ColorDepth::Ansi256   => "256 colours",
-            ColorDepth::TrueColor => "24-bit true colour",
+            ColorDepth::Ansi16    => "16 colors",
+            ColorDepth::Ansi256   => "256 colors",
+            ColorDepth::TrueColor => "24-bit true color",
         };
         let uni_label = if self.unicode { "Unicode" } else { "ASCII" };
         format!("{} ({}, {})", self.term_name, color_label, uni_label)
@@ -89,13 +89,13 @@ fn detect_color_depth(term: &str, colorterm: &str, term_program: &str) -> ColorD
         return ColorDepth::Monochrome;
     }
 
-    // 2. COLORTERM=truecolor|24bit → explicit true-colour opt-in
+    // 2. COLORTERM=truecolor|24bit → explicit true-color opt-in
     let ct = colorterm.to_ascii_lowercase();
     if ct == "truecolor" || ct == "24bit" {
         return ColorDepth::TrueColor;
     }
 
-    // 3. Known true-colour terminal programs
+    // 3. Known true-color terminal programs
     match term_program {
         "iTerm.app" | "WezTerm" | "Hyper" | "alacritty" | "vscode" => {
             return ColorDepth::TrueColor;
@@ -129,7 +129,7 @@ fn detect_color_depth(term: &str, colorterm: &str, term_program: &str) -> ColorD
         return ColorDepth::Monochrome;
     }
 
-    // 7. Unknown — assume 16 colours (conservative)
+    // 7. Unknown — assume 16 colors (conservative)
     ColorDepth::Ansi16
 }
 

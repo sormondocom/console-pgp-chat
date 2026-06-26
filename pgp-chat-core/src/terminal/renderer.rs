@@ -1,6 +1,6 @@
 //! Adaptive terminal renderer.
 //!
-//! Selects box-drawing characters (Unicode or ASCII) and colour attributes
+//! Selects box-drawing characters (Unicode or ASCII) and color attributes
 //! based on the detected [`TerminalCapability`].  All output goes through
 //! `crossterm` so the same code path works on every supported OS / terminal.
 
@@ -8,7 +8,8 @@ use crossterm::{
     cursor,
     queue,
     style::{
-        Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor,
+        Attribute, Color, Print, ResetColor, SetAttribute,
+        SetBackgroundColor, SetForegroundColor,
     },
     terminal::{Clear, ClearType},
 };
@@ -18,6 +19,7 @@ use super::{
     capability::{ColorDepth, TerminalCapability},
     color::ColorPalette,
 };
+use crate::persistence::ChatTheme;
 
 // ---------------------------------------------------------------------------
 // Border sets
@@ -52,7 +54,7 @@ pub(crate) const ASCII: BorderSet = BorderSet {
 // Renderer
 // ---------------------------------------------------------------------------
 
-/// Owns the detected capability, the colour palette, and the border set.
+/// Owns the detected capability, the color palette, and the border set.
 pub struct Renderer {
     cap:     TerminalCapability,
     palette: ColorPalette,
@@ -62,6 +64,14 @@ pub struct Renderer {
 impl Renderer {
     pub fn new(cap: TerminalCapability) -> Self {
         let palette = ColorPalette::for_depth(cap.color_depth);
+        let borders = if cap.unicode { UNICODE } else { ASCII };
+        Self { cap, palette, borders }
+    }
+
+    /// Build a renderer with chat colors overridden by the given theme.
+    pub fn with_theme(cap: TerminalCapability, theme: &ChatTheme) -> Self {
+        let mut palette = ColorPalette::for_depth(cap.color_depth);
+        palette.apply_chat_theme(theme, cap.color_depth);
         let borders = if cap.unicode { UNICODE } else { ASCII };
         Self { cap, palette, borders }
     }
@@ -147,7 +157,7 @@ impl Renderer {
 
     /// A single menu item row: `  [k] Label`.
     ///
-    /// `selected` highlights the row in the accent colour.
+    /// `selected` highlights the row in the accent color.
     pub fn draw_menu_item(&self, key: char, label: &str, selected: bool) -> io::Result<()> {
         let mut out = stdout();
         let color = if selected { self.palette.accent } else { self.palette.foreground };
@@ -180,13 +190,14 @@ impl Renderer {
         out.flush()
     }
 
-    /// A chat message row.
+    /// A chat message row from a remote peer.
     ///
-    /// - `timestamp`  — short time string, e.g. `"14:32"`
-    /// - `sender`     — nickname
+    /// - `timestamp`  — full date-time string, e.g. `"2026-06-24 14:32:07"`
+    /// - `sender`     — display name (may include a fingerprint suffix when
+    ///                  two peers share the same nickname)
     /// - `content`    — message body
     /// - `verified`   — whether the PGP signature checked out
-    /// - `peer_index` — stable index for per-peer colour
+    /// - `peer_index` — stable index for per-peer color rotation
     pub fn draw_message(
         &self,
         timestamp: &str,
@@ -196,14 +207,24 @@ impl Renderer {
         peer_index: usize,
     ) -> io::Result<()> {
         let mut out = stdout();
-        let peer_color = self.palette.peer_color(peer_index);
-        let sig_mark = if verified { "✓" } else { "?" };
-        // Fall back to ASCII on non-Unicode terminals
-        let sig_mark = if self.cap.unicode { sig_mark } else { if verified { "V" } else { "?" } };
+        // Use fixed peer ID color when set; otherwise rotate per peer.
+        let peer_color = if self.palette.chat_peer_id != Color::Reset {
+            self.palette.chat_peer_id
+        } else {
+            self.palette.peer_color(peer_index)
+        };
+        let sig_mark = if self.cap.unicode {
+            if verified { "✓" } else { "?" }
+        } else {
+            if verified { "V" } else { "?" }
+        };
 
+        if self.palette.chat_background != Color::Reset {
+            queue!(out, SetBackgroundColor(self.palette.chat_background))?;
+        }
         queue!(
             out,
-            SetForegroundColor(self.palette.dim),
+            SetForegroundColor(self.palette.chat_timestamp),
             Print(format!(" {} ", timestamp)),
             ResetColor,
             SetForegroundColor(peer_color),
@@ -212,11 +233,38 @@ impl Renderer {
             SetAttribute(Attribute::Reset),
             ResetColor,
             Print(" "),
-            SetForegroundColor(self.palette.foreground),
+            SetForegroundColor(self.palette.chat_peer_text),
             Print(content),
             Print("  "),
             SetForegroundColor(if verified { self.palette.success } else { self.palette.warning }),
             Print(sig_mark),
+            ResetColor,
+            Print("\r\n"),
+        )?;
+        out.flush()
+    }
+
+    /// A chat message row for messages sent by the local user.
+    ///
+    /// Rendered in the accent color so "You" is visually distinct from peers.
+    pub fn draw_own_message(&self, timestamp: &str, content: &str) -> io::Result<()> {
+        let mut out = stdout();
+        if self.palette.chat_background != Color::Reset {
+            queue!(out, SetBackgroundColor(self.palette.chat_background))?;
+        }
+        queue!(
+            out,
+            SetForegroundColor(self.palette.chat_timestamp),
+            Print(format!(" {} ", timestamp)),
+            ResetColor,
+            SetForegroundColor(self.palette.chat_own_id),
+            SetAttribute(Attribute::Bold),
+            Print("[You]"),
+            SetAttribute(Attribute::Reset),
+            ResetColor,
+            Print(" "),
+            SetForegroundColor(self.palette.chat_own_text),
+            Print(content),
             ResetColor,
             Print("\r\n"),
         )?;
@@ -239,13 +287,13 @@ impl Renderer {
         out.flush()
     }
 
-    /// Demonstrate colour capabilities: adapt output to detected depth.
+    /// Demonstrate color capabilities: adapt output to detected depth.
     pub fn draw_color_test(&self) -> io::Result<()> {
         let mut out = stdout();
         let w = self.width();
 
         queue!(out, Print("\r\n"))?;
-        self.draw_box_top("Colour Capability Test")?;
+        self.draw_box_top("Color Capability Test")?;
 
         match self.cap.color_depth {
             // ----------------------------------------------------------------
@@ -253,7 +301,7 @@ impl Renderer {
                 queue!(
                     out,
                     SetForegroundColor(self.palette.border), Print(self.borders.v), ResetColor,
-                    Print("  Monochrome terminal — no colour support."),
+                    Print("  Monochrome terminal — no color support."),
                     Print("\r\n"),
                     SetForegroundColor(self.palette.border), Print(self.borders.v), ResetColor,
                     Print("  Bold and underline are available for emphasis:"),
@@ -272,7 +320,7 @@ impl Renderer {
                 queue!(
                     out,
                     SetForegroundColor(self.palette.border), Print(self.borders.v), ResetColor,
-                    Print("  16 ANSI colours:\r\n"),
+                    Print("  16 ANSI colors:\r\n"),
                     SetForegroundColor(self.palette.border), Print(self.borders.v), ResetColor,
                     Print("  "),
                 )?;
@@ -294,7 +342,7 @@ impl Renderer {
                 queue!(
                     out,
                     SetForegroundColor(self.palette.border), Print(self.borders.v), ResetColor,
-                    Print("  256-colour palette (6×6×6 cube + greyscale ramp):\r\n"),
+                    Print("  256-color palette (6×6×6 cube + greyscale ramp):\r\n"),
                     SetForegroundColor(self.palette.border), Print(self.borders.v), ResetColor,
                     Print("  "),
                 )?;
@@ -324,7 +372,7 @@ impl Renderer {
                 queue!(
                     out,
                     SetForegroundColor(self.palette.border), Print(self.borders.v), ResetColor,
-                    Print("  24-bit true colour gradient:\r\n"),
+                    Print("  24-bit true color gradient:\r\n"),
                     SetForegroundColor(self.palette.border), Print(self.borders.v), ResetColor,
                     Print("  "),
                 )?;
@@ -369,10 +417,10 @@ impl Renderer {
 }
 
 // ---------------------------------------------------------------------------
-// Colour helpers
+// Color helpers
 // ---------------------------------------------------------------------------
 
-/// Map an index 0-15 to the corresponding basic ANSI colour.
+/// Map an index 0-15 to the corresponding basic ANSI color.
 fn ansi16_color(code: u8) -> Color {
     match code {
         0  => Color::Black,

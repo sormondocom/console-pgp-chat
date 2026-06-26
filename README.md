@@ -26,14 +26,28 @@ The root cause is centralisation: a single trusted party sits between every conv
 
 ## What It Is
 
-A fully peer-to-peer encrypted chat room written in pure Rust, designed to run on any terminal from a VT-100 to a 24-bit true-colour modern shell. The entire dependency tree is pure Rust — no C libraries, no native dependencies — which means it compiles and runs on every platform Rust supports.
+A fully peer-to-peer encrypted chat room written in pure Rust, designed to run on any terminal from a VT-100 to a 24-bit true-color modern shell. The entire dependency tree is pure Rust — no C libraries, no native dependencies — which means it compiles and runs on every platform Rust supports.
 
 ```
 Workspace layout
 ────────────────
-pgp-chat-core/    ← library: crypto, networking, terminal detection
-pgp-chat-demo/    ← interactive demo binary (menu-driven UI)
+pgp-chat-core/    ← library: crypto, networking, terminal detection, persistence
+pgp-chat/         ← interactive binary (menu-driven UI)  →  binary name: pgp-chat
 ```
+
+---
+
+## Main Menu
+
+On launch you are presented with a four-item menu and an ASCII mascot (two CRT terminals connected by an encrypted channel with a padlock in the centre):
+
+| Key | Option | Description |
+|---|---|---|
+| `1` | Start Chat | Connect to a room and exchange encrypted messages |
+| `2` | Manage Identities | Create, import, view, set active, or delete PGP identities |
+| `3` | Manage Rooms | Add, rename, update passphrase, or forget saved rooms |
+| `4` | Settings | Configure file paths and chat color theme |
+| `q` | Quit | Exit the application |
 
 ---
 
@@ -79,16 +93,20 @@ The public key is derived from the secret key. You only need to safeguard one th
 |---|---|---|
 | Generate new keypair | Creates **both** (secret + public) | Secret stays local; public is announced to peers automatically |
 | Import existing key | Your **secret key** file (`.asc`) | Starts with `-----BEGIN PGP PRIVATE KEY BLOCK-----`. The public key is derived from it — do NOT import a public-only key here |
-| Key passphrase | Protects the **secret key** | Encrypts the secret key on disk; you must enter it each session to unlock it |
+| Key passphrase | Protects the **secret key** | Encrypts the secret key on disk (S2K); you must enter it each session to unlock it |
 
 > **Common mistake:** exporting the public key from GnuPG (`gpg --export --armor`) and trying to import it here will fail — the app specifically needs the *secret* key (`gpg --export-secret-keys --armor`).
 
-#### Key Generation and Import
+#### Managing Multiple Identities
 
-On first use, choose one of:
+The app supports multiple named identities stored in the identities directory. Use **[2] Manage Identities** from the main menu to:
 
-- **Generate** — creates a fresh EdDSA primary key (signing) + ECDH Curve25519 subkey (encryption), optionally protected with a passphrase. The public key is derived automatically and announced to room peers on join.
-- **Import** — load an existing PGP secret key from an ASCII-armoured `.asc` file you already control (e.g. exported from GnuPG, Kleopatra, or another pgp-chat instance). The app reads only the secret key file; it derives and announces the public key itself.
+- **[n] New identity** — generate a fresh EdDSA primary key (signing) + ECDH Curve25519 subkey (encryption), optionally protected with a passphrase. The key is stored with S2K protection when a passphrase is set; a wrong passphrase at login is detected and rejected.
+- **[i] Import** — load an existing PGP secret key from an ASCII-armoured `.asc` file you already control (e.g. exported from GnuPG, Kleopatra, or another pgp-chat instance). The app reads only the secret key file; it derives and announces the public key itself.
+- **Enter a number** — view fingerprint, creation date, and set the identity as active.
+- **[d] Delete** — permanently remove an identity and its key file.
+
+One identity is designated **active** — this is the one used automatically when you start a chat session. If you have only one identity it is set active at creation time.
 
 Passphrases are handled with `Zeroizing<String>` — the passphrase is wiped from memory as soon as it is no longer needed.
 
@@ -98,11 +116,20 @@ Every room has a **room passphrase** — a shared secret that all legitimate par
 
 Every byte published to Gossipsub is **PGP-symmetrically encrypted** (AES-256) with the room passphrase before it leaves your node. Nodes without the passphrase see only opaque OpenPGP binary packets — they cannot even determine whether a packet is a chat message, a key announcement, or a file transfer.
 
-```
-Room passphrase [blank = derive from room name]:
-```
+#### Managing Saved Rooms
 
-If you leave it blank, a synthetic passphrase is derived from the room name (`pgp-chat:room:{name}`) — enough to distinguish rooms on the same network, but not a substitute for a real out-of-band passphrase in a sensitive session.
+Use **[3] Manage Rooms** to pre-configure rooms before starting a session:
+
+- **[n] Add room** — enter a name and passphrase. Leave the passphrase blank to **generate** a cryptographically random one (you become the room **owner** and the passphrase is displayed for sharing). Enter an existing passphrase to join as a **member**.
+- **Enter a number** — open the room detail screen:
+  - **[s] Show passphrase** — reveal the stored passphrase in a copy-friendly box
+  - **[n] Rename** — change the room's local label (does not affect the room network topic)
+  - **[p] Update passphrase** — replace the stored passphrase; blank generates a new one
+- **[f] Forget** — remove a room from the list. Owners must confirm with the stored passphrase; members confirm with `y`.
+
+When starting a chat session, you pick from your saved rooms. If no saved rooms exist, you are prompted to enter a room name and passphrase directly.
+
+If you leave the passphrase blank when entering manually, a synthetic passphrase is derived from the room name (`pgp-chat:room:{name}`) — enough to distinguish rooms on the same network, but not a substitute for a real out-of-band passphrase in a sensitive session.
 
 This is implemented in `pgp-chat-core/src/crypto/room_cipher.rs` (`seal` / `open`).
 
@@ -134,7 +161,7 @@ Keys are **never auto-trusted**. On receipt of a peer's `AnnounceKey` message, t
 
 | Mode | Incoming key goes to… |
 |---|---|
-| Normal | `pending` — requires explicit `[y]` approval |
+| Normal | `pending` — requires explicit `/trust` approval |
 | Deferring | `deferred` — held until you exit deferring mode |
 
 The keystore has four buckets:
@@ -150,7 +177,9 @@ Only keys in `trusted` are returned by `all_public_keys()` — rejected peers ca
 
 **Fingerprint cross-check** — the fingerprint field in the announcement header is verified against `key.fingerprint()` computed from the actual transmitted key. Mismatch = hard reject (cannot be manipulated or phished).
 
-**Deferring mode** (`[d]` key) — useful when joining a high-traffic room and you want to review all new keys at once rather than being interrupted by approval prompts. Toggle with `[d]`; on exit, all deferred keys are promoted to pending.
+**Deferring mode** (`/defer`) — useful when joining a high-traffic room and you want to review all new keys at once rather than being interrupted by approval prompts. Toggle with `/defer`; on exit, all deferred keys are promoted to pending.
+
+**Persistent contacts** — when you leave a session, trusted peers are saved to `contacts.json`. When you rejoin, they are loaded back and recognised automatically without re-approval.
 
 **Status announcements** — every node broadcasts its current status (`Online` / `Deferring`) on join, on status change, and every 60 seconds. A node that stops announcing is eventually marked `Offline`.
 
@@ -199,7 +228,7 @@ A message is only sent as `Encrypted` if at least one peer's key is trusted. Oth
 File transfer requires **mutual explicit consent** before any data moves:
 
 ```
-[f] Send file
+/send
     → Enter recipient fingerprint
     → Enter file path
     → Enter description (≤256 chars, encrypted)
@@ -209,8 +238,8 @@ Receiver sees:
         File:    report.pdf  (1.4 MB)
         Network: /ip4/192.168.1.10/tcp/9000, /ip4/.../udp/.../quic-v1
         Desc:    [decrypted description]
-    [r] Accept — enter save path
-    [z] Decline
+    /accept → Enter save path
+    /decline
 ```
 
 **Privacy guarantees:**
@@ -251,8 +280,9 @@ A passive adversary on the network sees Noise/QUIC ciphertext. An adversary who 
 | **No central trust** | No server, no certificate authority, no account system |
 | **Key ownership** | You generate or import your own key; the private key never leaves your device |
 | **Tamper detection** | Detached signatures cover the full `ChatMessage` JSON including UUID and timestamp |
-| **Explicit trust** | Keys require manual approval (`[y]`/`[a]`) — no TOFU auto-trust |
+| **Explicit trust** | Keys require manual approval (`/trust`/`/trustall`) — no TOFU auto-trust |
 | **Revocation** | Signed `Revoke` message; revoked fingerprint added to permanent drop list on all peers |
+| **Passphrase protection** | Keys are S2K-protected on disk; a wrong passphrase is detected and rejected at login |
 | **Passphrase zeroization** | `Zeroizing<String>` throughout; `Drop` impl on `PgpIdentity` zeroes passphrase field |
 
 ### Replay Protection
@@ -261,7 +291,7 @@ Each `ChatMessage` carries a UUIDv4. The room keeps a rolling window of the last
 
 ### Key Revocation — Nuke
 
-`[!]` triggers **Nuke** — a nuclear option for compromised or retiring identities:
+`/nuke` triggers **Nuke** — a nuclear option for compromised or retiring identities:
 
 1. Broadcasts a signed `Revoke` message (peers add your fingerprint to their permanent drop list)
 2. Clears keystore, node map, seen messages, and revoked fingerprint set in memory
@@ -274,40 +304,67 @@ Peers who receive the `Revoke` can never again receive encrypted messages from o
 
 ## Proving Out Security: End-to-End Sequence
 
-### Step 0 — Generate / Import Keys
+### Step 0 — Create Identities
 
-Each participant runs option **[3] Generate PGP Identity** or **[4] Import Existing PGP Secret Key** from the menu.
+Each participant opens **[2] Manage Identities** and presses **[n]** to generate a fresh identity:
 
-### Step 1 — Start Nodes
+```
+Identity name: work
+Display nickname: Alice
+Passphrase: ••••••••••••
+Confirm passphrase: ••••••••••••
+Generating EdDSA + ECDH keypair for "Alice"…
+[✓] Identity 'work' created.
+    Fingerprint: a1b2c3d4e5f6...
+```
 
-Both participants run option **[6] P2P Network Demo**. Alice starts first:
+### Step 1 — Set Up a Room
+
+Alice opens **[3] Manage Rooms**, presses **[n]**, enters a room name, and leaves the passphrase blank to generate one:
 
 ```
 Room name: secret-ops
-Room passphrase [blank = derive from room name]: ••••••••••••
-Listening on /ip4/192.168.1.10/tcp/9000
-Listening on /ip4/192.168.1.10/udp/9000/quic-v1
+Room passphrase [blank = generate]: (blank)
+
+  ╔══ Generated Room Passphrase (you are the owner) ════╗
+  ║  3f9a21bc4d8e7012c5ab...                            ║
+  ╚═══════════════════════════════════════════════════════╝
+  Share this with peers BEFORE they join.
 ```
 
-Bob starts and bootstraps to Alice:
+Alice shares the passphrase with Bob out-of-band. Bob opens **[3] Manage Rooms**, presses **[n]**, enters the same room name, and pastes Alice's passphrase.
+
+### Step 2 — Start Chat Nodes
+
+Both participants open **[1] Start Chat**.
+
+Alice selects her `work` identity, enters her passphrase, chooses a listen port, and picks `secret-ops` from her room list. She skips bootstrap (she is first):
+
+```
+  Listening on /ip4/192.168.1.10/tcp/9000
+  Listening on /ip4/192.168.1.10/udp/9000/quic-v1
+  Room: secret-ops  [owner]
+```
+
+Bob selects his identity, picks `secret-ops`, and bootstraps to Alice:
 
 ```
 Bootstrap peer multiaddr: /ip4/192.168.1.10/tcp/9000
 [*] Discovered peer: <Alice's PeerId>
 ```
 
-### Step 2 — Key Exchange and Approval
+### Step 3 — Key Exchange and Approval
 
 Alice's `AnnounceKey` arrives at Bob (room-cipher decrypted → signature verified → fingerprint cross-checked):
 
 ```
-Bob:  [?] New key from Alice (a1b2c3...) — [y] approve  [x] deny
-Bob:  [y]   →   Alice moved to trusted
+Bob:  [?] New key from Alice (a1b2c3...) — /trust to approve  /deny to reject
+Bob:  /trust   →   Alice moved to trusted
 ```
 
 Alice approves Bob's key. Both are now in each other's `trusted` bucket.
 
-### Step 3 — Encrypted Messaging
+### Step 4 — Encrypted Messaging
 
 ```
 Alice:  Hello, Bob!
@@ -316,40 +373,79 @@ Bob:    14:32 <Alice ✓> Hello, Bob!
 
 `✓` — EdDSA signature verified against Alice's trusted key.
 
-### Step 4 — File Transfer
+### Step 5 — File Transfer
 
 ```
-Alice:  [f] → recipient: 7f3e9d... → file: /home/alice/report.pdf → desc: "Q1 numbers"
+Alice:  /send → recipient: 7f3e9d... → file: /home/alice/report.pdf → desc: "Q1 numbers"
 Bob:    [?] Incoming file from Alice — report.pdf (1.4 MB) — desc: "Q1 numbers"
-Bob:    [r] → save to: /home/bob/downloads/report.pdf
+Bob:    /accept → save to: /home/bob/downloads/report.pdf
         [✓] report.pdf received — SHA-256 verified
 ```
 
-### Step 5 — Nuke
+### Step 6 — Nuke
 
 ```
-Alice:  [!] Type NUKE to confirm: NUKE
+Alice:  /nuke
+        Type NUKE to confirm: NUKE
         [!] NUKE complete — all identity material wiped.
 Bob:    [!] Peer a1b2c3... (Alice) has revoked their identity.
 ```
 
 ---
 
-## Key Bindings (P2P Network Demo)
+## Chat Commands
 
-| Key | Action |
+Once inside a chat session, type a message and press Enter to send. Commands begin with `/`:
+
+| Command | Action |
 |---|---|
-| `Enter` | Send message |
-| `y` | Approve pending key |
-| `x` | Deny pending key |
-| `a` | Approve all pending/deferred keys |
-| `d` | Toggle deferring mode |
-| `n` | Show node map (trust state, status, last seen) |
-| `f` | Send a file (prompts for recipient, path, description) |
-| `r` | Accept incoming file offer (prompts for save path) |
-| `z` | Decline incoming file offer |
-| `!` | Nuke — broadcast revocation, wipe all state, disconnect |
-| `q` | Quit |
+| `/help` | List all available commands |
+| `/quit` | Disconnect and return to the main menu |
+| `/peers` | Show connected peer list with trust state and last-seen time |
+| `/rooms` | Manage rooms (switch / join / leave / delete) during a session |
+| `/join <room>` | Switch to a different room by name |
+| `/trust [fp]` | Approve the last pending key, or a specific fingerprint |
+| `/deny [fp]` | Reject the last pending key, or a specific fingerprint |
+| `/trustall` | Approve all pending and deferred keys at once |
+| `/defer` | Toggle key-deferral mode on/off |
+| `/send` | Send a file (prompts for recipient fingerprint, file path, description) |
+| `/accept [path]` | Accept an incoming file offer and save to the given path |
+| `/decline` | Decline the current incoming file offer |
+| `/nuke` | Broadcast revocation, wipe all in-memory state, disconnect |
+| `Ctrl-C` / `Ctrl-D` | Quit immediately |
+
+---
+
+## Settings
+
+**[4] Settings** from the main menu provides three configuration areas:
+
+### Identities Directory
+
+The directory where named identity files (`.asc`) and the identity index (`identities.json`) are stored. Changing this path does not move existing files.
+
+### Downloads Directory
+
+The default save location for files received via `/accept`. You can override the path per-transfer at the `/accept` prompt.
+
+### Chat Theme
+
+An 8-field color editor for the chat display:
+
+| Field | What it colors |
+|---|---|
+| Timestamp | The `HH:MM:SS` prefix on each message |
+| Your ID | Your `[You]` sender label |
+| Your Text | Your message body |
+| Peer Name | The `<Nickname>` sender label for received messages |
+| Peer Text | Received message body |
+| Background | Row background (Default = transparent) |
+| Border | Box-drawing border characters |
+| System Msgs | System / status lines |
+
+Available colors: Default, White, Grey, DarkGrey, Black, Cyan, Green, Yellow, Magenta, Blue, Red.
+
+Named themes can be saved (`[s]`), loaded (`[l]`), and deleted (`[x]`). Reset to defaults at any time with `[r]`.
 
 ---
 
@@ -361,8 +457,8 @@ The library auto-detects terminal capability at startup:
 |---|---|---|
 | `NO_COLOR=1` set | Monochrome | Plain text only |
 | Basic VT-100, dumb | Monochrome | ASCII box-drawing |
-| ANSI (xterm, etc.) | 16-colour | Named ANSI colours |
-| 256-colour terminal | 256-colour | xterm-256 palette |
+| ANSI (xterm, etc.) | 16-color | Named ANSI colors |
+| 256-color terminal | 256-color | xterm-256 palette |
 | `COLORTERM=truecolor`, Windows Terminal, iTerm2 | 24-bit TrueColor | Full RGB |
 
 Unicode box-drawing characters are used when the locale or terminal indicates UTF-8 support; ASCII fallback (`+`, `-`, `|`) is used otherwise. Every rendering path goes through `crossterm`, which handles Windows Console API and Unix termios transparently.
@@ -376,9 +472,9 @@ Unicode box-drawing characters are used when the locale or terminal indicates UT
 cargo build --release
 
 # Run the interactive demo
-cargo run -p pgp-chat-demo
+cargo run -p pgp-chat
 
-# Run the crypto unit tests (17 tests)
+# Run the crypto unit tests
 cargo test -p pgp-chat-core
 ```
 
@@ -389,40 +485,70 @@ cargo test -p pgp-chat-core
 | `RUST_LOG=info` | Show connection and peer discovery events |
 | `RUST_LOG=debug` | Show all libp2p internals (verbose) |
 | `NO_COLOR=1` | Force monochrome output |
-| `COLORTERM=truecolor` | Force 24-bit colour detection |
+| `COLORTERM=truecolor` | Force 24-bit color detection |
+
+---
+
+## Storage Layout
+
+```
+%APPDATA%\pgp-chat\          (Windows)
+~/.pgp-chat/                  (Unix / macOS)
+  config.json             ← app configuration (directories, active identity, saved themes)
+  rooms.json              ← saved rooms: name, passphrase, and owner/member role
+  contacts.json           ← trusted peer public keys + rejected fingerprints
+  identities/
+    identities.json       ← index: name, nickname, fingerprint, created timestamp
+    {name}.asc            ← individual ASCII-armoured secret key files (S2K-protected)
+```
+
+The secret key files are protected by the user's chosen passphrase (S2K). The contacts file contains only public keys so it carries no secret material. Rooms are stored with their passphrases — protect access to this directory on shared machines.
 
 ---
 
 ## Architecture Reference
 
 ```
-pgp-chat-core
+pgp-chat-core/
 ├── crypto/
-│   ├── identity.rs     PgpIdentity — generate, import, armoured I/O, passphrase zeroization
-│   ├── encrypt.rs      encrypt_for_recipients, decrypt_message (ECDH subkeys)
-│   ├── sign.rs         sign_data, verify_data (StandaloneSignature / EdDSA)
-│   └── room_cipher.rs  seal / open — PGP symmetric AES-256 keyed by room passphrase
+│   ├── identity.rs       PgpIdentity — generate, import, armoured I/O, S2K passphrase, zeroization
+│   ├── encrypt.rs        encrypt_for_recipients, decrypt_message (ECDH subkeys)
+│   ├── sign.rs           sign_data, verify_data (StandaloneSignature / EdDSA)
+│   └── room_cipher.rs    seal / open — PGP symmetric AES-256 keyed by room passphrase
 ├── chat/
-│   ├── message.rs      ChatMessage, SignedChatMessage, MessageKind (9 variants)
-│   ├── keystore.rs     PeerKeyStore — four-bucket (trusted/pending/deferred/rejected)
-│   ├── trust.rs        TrustState, NodeStatus, NodeInfo
-│   ├── transfer.rs     FileOffer, FileAccept, FileDecline, FileChunk, FileComplete,
-│   │                   InboundTransfer, PendingOffer — file transfer wire types
-│   └── room.rs         ChatRoom — async coordinator, room cipher, trust gating,
-│                       replay dedup, sig enforcement, nuke, file transfer
+│   ├── message.rs        ChatMessage, SignedChatMessage, MessageKind (9 variants)
+│   ├── keystore.rs       PeerKeyStore — four-bucket (trusted/pending/deferred/rejected)
+│   ├── trust.rs          TrustState, NodeStatus, NodeInfo
+│   ├── transfer.rs       FileOffer, FileAccept, FileDecline, FileChunk, FileComplete,
+│   │                     InboundTransfer, PendingOffer — file transfer wire types
+│   └── room.rs           ChatRoom — async coordinator, room cipher, trust gating,
+│                         replay dedup, sig enforcement, nuke, file transfer
 ├── network/
-│   ├── behaviour.rs    ChatBehaviour (#[derive(NetworkBehaviour)])
-│   ├── transport.rs    build_swarm — TCP+Noise+Yamux + QUIC + Gossipsub + Kademlia + Identify
-│   ├── peer_discovery.rs   bootstrap, handle_identify_event, add_gossipsub_peer
-│   └── event.rs        ChatNetEvent — typed events from network layer to UI
-└── terminal/
-    ├── capability.rs   ColorDepth detection, TerminalCapability
-    ├── color.rs        ColorPalette — semantic colour roles per depth tier
-    └── renderer.rs     Renderer — adaptive box/message/menu drawing via crossterm
+│   ├── behaviour.rs      ChatBehaviour (#[derive(NetworkBehaviour)])
+│   ├── transport.rs      build_swarm — TCP+Noise+Yamux + QUIC + Gossipsub + Kademlia + Identify
+│   ├── peer_discovery.rs bootstrap, handle_identify_event, add_gossipsub_peer
+│   └── event.rs          ChatNetEvent — typed events from network layer to UI
+├── terminal/
+│   ├── capability.rs     ColorDepth detection, TerminalCapability
+│   ├── color.rs          ColorPalette — semantic color roles per depth tier
+│   └── renderer.rs       Renderer — adaptive box/message/menu drawing via crossterm
+└── persistence.rs        AppConfig, ChatTheme, ThemeColor, IdentityEntry,
+                          PersistedRoom, PersistedContact, PersistedTrustStore
+
+pgp-chat/
+└── src/
+    ├── main.rs
+    ├── menu.rs                  main menu — 4 entries + quit, mascot render
+    ├── ui.rs                    Ui — prompts, password input, mascot, passphrase reveal box
+    └── commands/
+        ├── identity_manager.rs  Manage Identities — list, create, import, view, set active, delete
+        ├── room_manager.rs      Manage Rooms — add, detail, show passphrase, rename, update, forget
+        ├── network_demo.rs      Start Chat — swarm startup, room loop, slash-command handler
+        └── settings.rs          Settings — directories, chat theme editor, named theme save/load
 ```
 
 ---
 
 ## License
 
-GNUv3
+GNU General Public License v3 (GPLv3)

@@ -4,7 +4,7 @@
 //!
 //! ## Modules
 //!
-//! - [`terminal`] — capability detection (VT-100 → 24-bit true colour) and
+//! - [`terminal`] — capability detection (VT-100 → 24-bit true color) and
 //!   adaptive rendering that degrades gracefully across every terminal type.
 //! - [`crypto`] — PGP identity management, message encryption/decryption,
 //!   and detached signatures via rPGP (pure Rust).
@@ -18,6 +18,7 @@ pub mod chat;
 pub mod crypto;
 pub mod error;
 pub mod network;
+pub mod persistence;
 pub mod terminal;
 
 pub use error::{Error, Result};

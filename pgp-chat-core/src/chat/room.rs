@@ -34,6 +34,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use sha2::{Sha256, Digest};
+
 use crate::{
     chat::{
         keystore::PeerKeyStore,
@@ -51,6 +53,7 @@ use crate::{
         event::ChatNetEvent,
         peer_discovery,
     },
+    persistence::{PersistedContact, PersistedTrustStore},
 };
 
 // ---------------------------------------------------------------------------
@@ -171,11 +174,15 @@ impl ChatRoom {
     ///
     /// Does not start listening or running — call `swarm.listen_on()` before
     /// handing the swarm here, then `tokio::spawn(room.run())`.
+    ///
+    /// `initial_keystore` may be pre-populated with trusted contacts loaded
+    /// from disk; pass `PeerKeyStore::new()` for a fresh session.
     pub fn new(
         swarm: Swarm<ChatBehaviour>,
         room_name: &str,
         identity: PgpIdentity,
         room_passphrase: Zeroizing<String>,
+        initial_keystore: PeerKeyStore,
     ) -> (Self, ChatRoomHandle) {
         let local_peer_id = *swarm.local_peer_id();
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
@@ -186,7 +193,7 @@ impl ChatRoom {
             topic: IdentTopic::new(room_name),
             identity,
             room_passphrase,
-            keystore: PeerKeyStore::new(),
+            keystore: initial_keystore,
             node_map: HashMap::new(),
             revoked_fps: HashSet::new(),
             is_deferring: false,
@@ -207,7 +214,11 @@ impl ChatRoom {
 
     /// Drive the swarm and command channel until `RoomCommand::Disconnect` or
     /// `RoomCommand::Nuke`.
-    pub async fn run(mut self) {
+    ///
+    /// Returns `Some(PersistedTrustStore)` on a graceful disconnect so the
+    /// caller can save contacts to disk.  Returns `None` after a Nuke (all
+    /// state has been deliberately wiped) or an unexpected channel drop.
+    pub async fn run(mut self) -> Option<PersistedTrustStore> {
         // Subscribe to the gossipsub topic
         if let Err(e) = self.swarm.behaviour_mut().gossipsub.subscribe(&self.topic) {
             warn!("gossipsub subscribe failed: {e}");
@@ -233,10 +244,34 @@ impl ChatRoom {
                 // ── UI commands ───────────────────────────────────────────
                 cmd = self.cmd_rx.recv() => {
                     match cmd {
+                        Some(RoomCommand::Disconnect) => {
+                            info!("chat room disconnecting — saving trust snapshot");
+                            return Some(self.build_trust_snapshot());
+                        }
+                        Some(RoomCommand::Nuke) => {
+                            // 1. Broadcast a signed revocation (best-effort)
+                            let fp = self.identity.fingerprint();
+                            let msg = ChatMessage::new_revoke(
+                                &self.topic.hash().to_string(),
+                                &fp,
+                                self.identity.nickname(),
+                            );
+                            let _ = self.publish_message(msg).await;
+
+                            // 2. Wipe all state
+                            self.keystore.nuke();
+                            self.node_map.clear();
+                            self.seen_messages.clear();
+                            self.revoked_fps.clear();
+
+                            // 3. Notify UI
+                            let _ = self.event_tx.send(ChatNetEvent::NukeComplete).await;
+
+                            info!("chat room nuked — state wiped, not saving contacts");
+                            return None;
+                        }
                         Some(cmd) => {
-                            if self.handle_command(cmd).await {
-                                break; // Nuke or Disconnect
-                            }
+                            self.handle_command(cmd).await;
                         }
                         None => break,
                     }
@@ -251,15 +286,49 @@ impl ChatRoom {
             }
         }
 
-        info!("chat room shutting down");
+        info!("chat room shutting down unexpectedly");
+        None
+    }
+
+    /// Build a `PersistedTrustStore` snapshot from the current in-memory state.
+    fn build_trust_snapshot(&self) -> PersistedTrustStore {
+        use pgp::ArmorOptions;
+
+        let contacts: Vec<PersistedContact> = self
+            .keystore
+            .export_trusted()
+            .into_iter()
+            .filter_map(|(fp, nick, key)| {
+                let armored = key
+                    .to_armored_string(ArmorOptions::default())
+                    .ok()?;
+                let last_seen = self.node_map.get(&fp).map(|n| n.last_seen);
+                Some(PersistedContact {
+                    fingerprint: fp,
+                    nickname: nick,
+                    armored_public_key: armored,
+                    last_seen,
+                })
+            })
+            .collect();
+
+        PersistedTrustStore {
+            contacts,
+            rejected: self.keystore.rejected_fingerprints(),
+        }
     }
 
     // -----------------------------------------------------------------------
     // Command dispatch — returns true to break the run() loop
     // -----------------------------------------------------------------------
 
-    async fn handle_command(&mut self, cmd: RoomCommand) -> bool {
+    async fn handle_command(&mut self, cmd: RoomCommand) {
         match cmd {
+            // Disconnect and Nuke are handled directly in run() — they must not reach here.
+            RoomCommand::Disconnect | RoomCommand::Nuke => {
+                warn!("Disconnect/Nuke reached handle_command — this is a bug");
+            }
+
             RoomCommand::SendPlaintext(text) => {
                 if let Err(e) = self.publish_plaintext(&text).await {
                     warn!("publish plaintext failed: {e}");
@@ -269,6 +338,7 @@ impl ChatRoom {
             RoomCommand::SendEncrypted { body } => {
                 if let Err(e) = self.publish_encrypted(&body).await {
                     warn!("publish encrypted failed: {e}");
+                    let _ = self.event_tx.send(ChatNetEvent::Warning(e.to_string())).await;
                 }
             }
 
@@ -384,36 +454,7 @@ impl ChatRoom {
                 }
             }
 
-            RoomCommand::Nuke => {
-                // 1. Broadcast a signed revocation (best-effort; ignore errors)
-                let fp = self.identity.fingerprint();
-                let msg = ChatMessage::new_revoke(
-                    &self.topic.hash().to_string(),
-                    &fp,
-                    self.identity.nickname(),
-                );
-                let _ = self.publish_message(msg).await;
-
-                // 2. Wipe keystore
-                self.keystore.nuke();
-
-                // 3. Wipe node map and seen messages
-                self.node_map.clear();
-                self.seen_messages.clear();
-                self.revoked_fps.clear();
-
-                // 4. Notify UI
-                let _ = self.event_tx.send(ChatNetEvent::NukeComplete).await;
-
-                // 5. Break the run loop (identity dropped → passphrase zeroized)
-                return true;
-            }
-
-            RoomCommand::Disconnect => {
-                return true;
-            }
         }
-        false
     }
 
     // -----------------------------------------------------------------------
@@ -489,6 +530,17 @@ impl ChatRoom {
                     Err(e) => { debug!("failed to deserialise message: {e}"); return; }
                 };
 
+                // ── Timestamp window — replay protection ───────────────────
+                // Reject messages older than 5 minutes or more than 60 seconds
+                // in the future (clock skew tolerance).  This limits the window
+                // for cross-session replay attacks even when seen_messages is
+                // reset on restart.
+                let age_secs = (Utc::now() - signed.message.timestamp).num_seconds();
+                if age_secs > 300 || age_secs < -60 {
+                    debug!(%age_secs, "dropping message outside ±5-min / +60s window");
+                    return;
+                }
+
                 // ── Replay deduplication ───────────────────────────────────
                 let msg_id = signed.message.id;
                 if self.seen_messages.contains(&msg_id) {
@@ -541,49 +593,66 @@ impl ChatRoom {
                             sender_fp,
                             nickname,
                             public_key_armored,
+                            verified,
                         ).await;
                     }
 
-                    MessageKind::StatusAnnounce { status } => {
+                    // Status updates are accepted only from verified senders.
+                    // An unverified peer cannot manipulate another peer's online/offline status.
+                    MessageKind::StatusAnnounce { status } if verified => {
                         self.handle_status_announce(sender_fp, &signed.message.sender_nick, status.clone());
                     }
 
                     MessageKind::Revoke { fingerprint } if verified => {
-                        self.handle_revocation(fingerprint, &signed.message.sender_nick).await;
-                    }
-
-                    MessageKind::FileOffer { encrypted_offer, recipient_fp } => {
-                        if recipient_fp == &self.identity.fingerprint() {
-                            self.handle_inbound_offer(encrypted_offer, &signed.message.sender_nick).await;
+                        // A peer may only revoke their own fingerprint — never someone else's.
+                        if fingerprint != sender_fp {
+                            warn!(
+                                %sender_fp, %fingerprint,
+                                "peer tried to revoke a different fingerprint — ignoring"
+                            );
+                        } else {
+                            self.handle_revocation(fingerprint, &signed.message.sender_nick).await;
                         }
                     }
 
-                    MessageKind::FileAccept(accept) => {
+                    MessageKind::FileOffer { encrypted_offer, recipient_fp } if verified => {
+                        if recipient_fp == &self.identity.fingerprint() {
+                            // Pass the outer verified sender_fp so handle_inbound_offer
+                            // can cross-check the inner offer's claimed sender identity.
+                            self.handle_inbound_offer(encrypted_offer, sender_fp).await;
+                        }
+                    }
+
+                    MessageKind::FileAccept(accept) if verified => {
                         self.handle_file_accept(accept.clone(), &signed.message.sender_fp).await;
                     }
 
-                    MessageKind::FileDecline(decline) => {
-                        self.handle_file_decline(decline.clone()).await;
+                    MessageKind::FileDecline(decline) if verified => {
+                        self.handle_file_decline(decline.clone(), sender_fp).await;
                     }
 
-                    MessageKind::FileChunk(chunk) => {
+                    MessageKind::FileChunk(chunk) if verified => {
                         self.handle_file_chunk(chunk.clone()).await;
                     }
 
-                    MessageKind::FileComplete(complete) => {
+                    MessageKind::FileComplete(complete) if verified => {
                         self.handle_file_complete(complete.clone()).await;
                     }
 
                     _ => {}
                 }
 
-                // Forward raw decrypted payload to UI for display
+                // Forward raw decrypted payload to UI for display.
+                // `verified` tells the UI whether the sender's PGP signature
+                // checked out against a trusted key — it MUST show a visual
+                // warning for unverified senders to prevent nick spoofing.
                 let _ = self
                     .event_tx
                     .send(ChatNetEvent::MessageReceived {
-                        from:    propagation_source,
+                        from:     propagation_source,
                         topic,
-                        payload: decrypted_bytes,
+                        payload:  decrypted_bytes,
+                        verified,
                     })
                     .await;
             }
@@ -616,6 +685,7 @@ impl ChatRoom {
         announced_fp: &str,
         nickname: &str,
         armored: &str,
+        was_verified: bool,
     ) {
         use pgp::composed::{Deserializable, SignedPublicKey};
         use pgp::types::KeyTrait;
@@ -626,8 +696,29 @@ impl ChatRoom {
             return;
         }
 
-        // Already known (trusted, pending, or deferred) — nothing to do
+        // If we already know this fingerprint, check whether it's a previously-
+        // trusted contact reconnecting from a new ephemeral libp2p identity.
+        // Update the peer_map so encryption / lookup by PeerId keeps working.
         if self.keystore.is_known(announced_fp) {
+            if self.keystore.trust_state(announced_fp) == Some(TrustState::Trusted) {
+                // Require a valid signature before updating any trusted-contact state.
+                // Without this check, any room participant who observed a contact's
+                // fingerprint could forge a reconnect event and hijack the peer_map.
+                if !was_verified {
+                    warn!(
+                        %peer_id, %announced_fp,
+                        "ignoring unverified AnnounceKey for trusted fingerprint — possible impersonation"
+                    );
+                    return;
+                }
+                // Use the locally-stored nickname (authoritative) instead of the
+                // wire-supplied one so a peer cannot rename themselves in our UI.
+                let display_nick = self.keystore.trusted_nick(announced_fp).unwrap_or(nickname).to_string();
+                self.keystore.update_peer_mapping(peer_id, announced_fp);
+                self.node_map_upsert(announced_fp, &display_nick, TrustState::Trusted, NodeStatus::Online);
+                info!(%peer_id, %announced_fp, %display_nick, "trusted contact reconnected");
+                let _ = self.event_tx.send(ChatNetEvent::PeerDiscovered(peer_id)).await;
+            }
             return;
         }
 
@@ -786,24 +877,26 @@ impl ChatRoom {
 
         let recipients: Vec<_> = self.keystore.all_public_keys();
         if recipients.is_empty() {
-            let _ = self
-                .event_tx
-                .send(ChatNetEvent::Warning(
-                    "No trusted peer keys known — sending as plaintext".to_string(),
-                ))
-                .await;
-            return self.publish_plaintext(body).await;
+            // Refuse to silently downgrade to plaintext — the caller explicitly
+            // requested encryption.  Return an error so the UI can surface it.
+            return Err(Error::PgpEncryption(
+                "no trusted peers — approve at least one key before sending encrypted messages"
+                    .to_string(),
+            ));
         }
 
+        let recipient_count = recipients.len();
         let ciphertext = encrypt::encrypt_for_recipients(body.as_bytes(), &recipients)?;
-        let fingerprints = self.keystore.known_fingerprints();
 
+        // Pass only the count — never the fingerprints.  Putting the full
+        // recipient list on the wire would let anyone with the room passphrase
+        // (including unapproved peers) reconstruct the social graph.
         let msg = ChatMessage::new_encrypted(
             &self.topic.hash().to_string(),
             &self.identity.fingerprint(),
             self.identity.nickname(),
             ciphertext,
-            fingerprints,
+            recipient_count,
         );
         self.publish_message(msg).await
     }
@@ -832,12 +925,13 @@ impl ChatRoom {
             .unwrap_or("file")
             .to_string();
 
-        // Cap description
-        let description = if description.len() > MAX_DESCRIPTION_LEN {
-            description[..MAX_DESCRIPTION_LEN].to_string()
-        } else {
-            description.to_string()
-        };
+        // Cap description — use char boundary to avoid panicking on multi-byte UTF-8.
+        let description = description
+            .char_indices()
+            .nth(MAX_DESCRIPTION_LEN)
+            .map(|(i, _)| &description[..i])
+            .unwrap_or(description)
+            .to_string();
 
         let transfer_id = Uuid::new_v4();
         let size_bytes = file_bytes.len() as u64;
@@ -964,18 +1058,11 @@ impl ChatRoom {
             }).await;
         }
 
-        // Send SHA-256 completion message
+        // Send SHA-256 completion message (real SHA-256 via sha2 crate).
         let sha256 = {
-            use std::hash::{Hash, Hasher};
-            // Use a proper SHA-256 via a hex string of the data hash.
-            // We use sha2 if available; fallback to a simple hex of len for now.
-            // NOTE: sha2 crate is not in deps — use a simple approach here.
-            // The integrity check is still enforced; we use the file length + a
-            // deterministic hash derived from the encrypted chunks' sizes.
-            // For a production implementation, add sha2 = "0.10" to Cargo.toml.
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            file_bytes.hash(&mut hasher);
-            format!("{:016x}", hasher.finish())
+            let mut h = Sha256::new();
+            h.update(&file_bytes);
+            format!("{:x}", h.finalize())
         };
 
         let complete_msg = ChatMessage::new_file_complete(
@@ -988,8 +1075,29 @@ impl ChatRoom {
         info!(%tid, "file transfer complete, sha256={sha256}");
     }
 
-    async fn handle_file_decline(&mut self, decline: FileDecline) {
+    async fn handle_file_decline(&mut self, decline: FileDecline, sender_fp: &str) {
         let tid = decline.transfer_id;
+
+        // Verify the decliner is the peer the offer was actually addressed to.
+        // A verified-but-wrong peer (Carol) cannot cancel a transfer offered to Alice.
+        // Also return early for unknown transfer IDs so verified peers cannot
+        // inject spurious FileDeclined events for non-existent transfers.
+        let pending = match self.pending_offers.get(&tid) {
+            Some(p) => p,
+            None => {
+                warn!(%tid, "FileDecline for unknown transfer — ignoring");
+                return;
+            }
+        };
+        if decline.receiver_fp != pending.offer.recipient_fp {
+            warn!(%tid, "FileDecline receiver_fp does not match offer recipient — ignoring");
+            return;
+        }
+        if sender_fp != decline.receiver_fp {
+            warn!(%tid, "FileDecline signer does not match receiver_fp — ignoring");
+            return;
+        }
+
         self.pending_offers.remove(&tid);
         info!(%tid, "file offer declined by recipient");
         let _ = self.event_tx.send(ChatNetEvent::FileDeclined { transfer_id: tid }).await;
@@ -999,7 +1107,7 @@ impl ChatRoom {
     // File transfer — inbound
     // -----------------------------------------------------------------------
 
-    async fn handle_inbound_offer(&mut self, encrypted_offer: &[u8], sender_nick: &str) {
+    async fn handle_inbound_offer(&mut self, encrypted_offer: &[u8], verified_sender_fp: &str) {
         // Decrypt the offer with our secret key
         let offer_bytes = match encrypt::decrypt_message(
             encrypted_offer,
@@ -1021,7 +1129,28 @@ impl ChatRoom {
             }
         };
 
+        // The outer SignedChatMessage was signed by verified_sender_fp.
+        // Reject offers where the inner sender_info claims a DIFFERENT fingerprint —
+        // a trusted peer must not be able to impersonate another trusted peer in
+        // the consent dialog by crafting a mismatched inner payload.
+        if offer.sender_info.fingerprint != verified_sender_fp {
+            warn!(
+                outer_fp = %verified_sender_fp,
+                inner_fp = %offer.sender_info.fingerprint,
+                "FileOffer inner sender fingerprint does not match outer signature — ignoring"
+            );
+            return;
+        }
+
         let tid = offer.transfer_id;
+
+        // Reject absurdly large offers before the u32 chunk-count arithmetic can overflow.
+        const MAX_OFFER_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
+        if offer.size_bytes > MAX_OFFER_BYTES {
+            warn!(%tid, size = offer.size_bytes, "rejecting oversized file offer");
+            return;
+        }
+
         let total_chunks = (offer.size_bytes as usize).div_ceil(CHUNK_BYTES) as u32;
 
         // Emit event to UI for consent
@@ -1036,7 +1165,7 @@ impl ChatRoom {
         }).await.ok();
 
         self.inbound_transfers.insert(tid, InboundTransfer::new(offer, total_chunks));
-        info!(%tid, "inbound file offer from {sender_nick}, total_chunks={total_chunks}");
+        info!(%tid, %verified_sender_fp, "inbound file offer, total_chunks={total_chunks}");
     }
 
     async fn handle_file_chunk(&mut self, chunk: FileChunk) {
@@ -1093,11 +1222,12 @@ impl ChatRoom {
 
         let plaintext = transfer.assemble();
 
-        // Verify integrity (SHA-256 / hash check)
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        plaintext.hash(&mut hasher);
-        let computed = format!("{:016x}", hasher.finish());
+        // Verify integrity with real SHA-256.
+        let computed = {
+            let mut h = Sha256::new();
+            h.update(&plaintext);
+            format!("{:x}", h.finalize())
+        };
         if computed != complete.sha256 {
             let _ = self.event_tx.send(ChatNetEvent::FileTransferError {
                 transfer_id: tid,

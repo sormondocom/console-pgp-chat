@@ -1,9 +1,9 @@
 [workspace]
-members  = ["pgp-chat-core", "pgp-chat-demo"]
+members  = ["pgp-chat-core", "pgp-chat"]
 resolver = "2"
 
 [workspace.package]
-version      = "0.1.0"
+version      = "0.2.0"
 edition      = "2021"
 rust-version = "1.75"
 license      = "MIT OR Apache-2.0"
@@ -52,3 +52,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono  = { version = "0.4", features = ["serde"] }
 uuid    = { version = "1",   features = ["v4", "serde"] }
 zeroize = { version = "1",   features = ["derive"] }
+sha2    = { version = "0.10", default-features = false, features = ["std"] }

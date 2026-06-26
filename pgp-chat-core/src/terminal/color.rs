@@ -1,18 +1,19 @@
-//! Semantic colour palettes that adapt to the detected [`ColorDepth`].
+//! Semantic color palettes that adapt to the detected [`ColorDepth`].
 //!
 //! The palette maps *roles* (accent, success, error, …) to concrete
 //! `crossterm::style::Color` values appropriate for each tier.  The caller
-//! never hardcodes ANSI escape sequences; it just asks for a role colour and
+//! never hardcodes ANSI escape sequences; it just asks for a role color and
 //! lets the palette decide the best representation.
 
 use crossterm::style::Color;
 use super::capability::ColorDepth;
+use crate::persistence::{ChatTheme, ThemeColor};
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Semantic colour roles used throughout the UI.
+/// Semantic color roles used throughout the UI.
 #[derive(Debug, Clone)]
 pub struct ColorPalette {
     pub background:  Color,
@@ -24,8 +25,19 @@ pub struct ColorPalette {
     pub dim:         Color,
     pub highlight:   Color,
     pub border:      Color,
-    /// Rotating per-peer attribution colours — index with `peer_color(n)`.
+    /// Rotating per-peer attribution colors — index with `peer_color(n)`.
     pub peer_colors: Vec<Color>,
+    // Chat message colors — overridden by ChatTheme when one is active.
+    pub chat_timestamp:  Color,
+    pub chat_own_id:     Color,
+    pub chat_own_text:   Color,
+    /// Fixed color for peer sender labels, or `Color::Reset` to use rotation.
+    pub chat_peer_id:    Color,
+    pub chat_peer_text:  Color,
+    /// Background behind message rows; `Color::Reset` = terminal default.
+    pub chat_background: Color,
+    /// Color for system / status lines.
+    pub chat_system:     Color,
 }
 
 impl ColorPalette {
@@ -39,7 +51,7 @@ impl ColorPalette {
         }
     }
 
-    /// Return a peer colour, wrapping around if `index` exceeds the list.
+    /// Return a peer color, wrapping around if `index` exceeds the list.
     pub fn peer_color(&self, index: usize) -> Color {
         self.peer_colors[index % self.peer_colors.len()]
     }
@@ -48,8 +60,22 @@ impl ColorPalette {
     // Tier implementations
     // -----------------------------------------------------------------------
 
+    /// Override chat colors and optionally border from a persisted `ChatTheme`.
+    pub fn apply_chat_theme(&mut self, theme: &ChatTheme, depth: ColorDepth) {
+        self.chat_timestamp  = tc_to_color(theme.timestamp,  depth);
+        self.chat_own_id     = tc_to_color(theme.own_id,     depth);
+        self.chat_own_text   = tc_to_color(theme.own_text,   depth);
+        self.chat_peer_id    = tc_to_color(theme.peer_id,    depth); // Reset = use rotation
+        self.chat_peer_text  = tc_to_color(theme.peer_text,   depth);
+        self.chat_background = tc_to_color(theme.background,  depth); // Reset = transparent
+        self.chat_system     = tc_to_color(theme.system_text, depth);
+        if theme.border != ThemeColor::Default {
+            self.border = tc_to_color(theme.border, depth);
+        }
+    }
+
     fn monochrome() -> Self {
-        // No ANSI colours — use Color::Reset everywhere.
+        // No ANSI colors — use Color::Reset everywhere.
         // The renderer uses Attribute::Bold / Underlined for emphasis.
         Self {
             background:  Color::Reset,
@@ -61,7 +87,14 @@ impl ColorPalette {
             dim:         Color::Reset,
             highlight:   Color::Reset,
             border:      Color::Reset,
-            peer_colors: vec![Color::Reset],
+            peer_colors:     vec![Color::Reset],
+            chat_timestamp:  Color::Reset,
+            chat_own_id:     Color::Reset,
+            chat_own_text:   Color::Reset,
+            chat_peer_id:    Color::Reset,
+            chat_peer_text:  Color::Reset,
+            chat_background: Color::Reset,
+            chat_system:     Color::Reset,
         }
     }
 
@@ -81,13 +114,20 @@ impl ColorPalette {
                 Color::Magenta, Color::Blue, Color::Red,
                 Color::White, Color::DarkGreen,
             ],
+            chat_timestamp:  Color::White,
+            chat_own_id:     Color::Cyan,
+            chat_own_text:   Color::White,
+            chat_peer_id:    Color::Reset,
+            chat_peer_text:  Color::White,
+            chat_background: Color::Reset,
+            chat_system:     Color::DarkGrey,
         }
     }
 
     fn ansi256() -> Self {
-        // Use the 256-colour palette for richer but still universally
-        // supported values.  Index 0-15 are the same as the 16-colour names;
-        // 16-231 are the 6×6×6 colour cube; 232-255 are the greyscale ramp.
+        // Use the 256-color palette for richer but still universally
+        // supported values.  Index 0-15 are the same as the 16-color names;
+        // 16-231 are the 6×6×6 color cube; 232-255 are the greyscale ramp.
         Self {
             background:  Color::AnsiValue(235), // dark grey
             foreground:  Color::AnsiValue(252), // near-white
@@ -108,6 +148,13 @@ impl ColorPalette {
                 Color::AnsiValue(39),  // sky blue
                 Color::AnsiValue(196), // red
             ],
+            chat_timestamp:  Color::AnsiValue(255), // white
+            chat_own_id:     Color::AnsiValue(51),  // bright cyan
+            chat_own_text:   Color::AnsiValue(255), // white
+            chat_peer_id:    Color::Reset,           // use rotation
+            chat_peer_text:  Color::AnsiValue(255), // white
+            chat_background: Color::Reset,           // transparent
+            chat_system:     Color::AnsiValue(240), // mid-grey
         }
     }
 
@@ -133,6 +180,37 @@ impl ColorPalette {
                 Color::Rgb { r: 180, g: 240, b: 80  }, // lime
                 Color::Rgb { r: 80,  g: 160, b: 240 }, // sky blue
             ],
+            chat_timestamp:  Color::Rgb { r: 255, g: 255, b: 255 }, // white
+            chat_own_id:     Color::Rgb { r: 64,  g: 220, b: 230 }, // bright cyan
+            chat_own_text:   Color::Rgb { r: 255, g: 255, b: 255 }, // white
+            chat_peer_id:    Color::Reset,                           // use rotation
+            chat_peer_text:  Color::Rgb { r: 255, g: 255, b: 255 }, // white
+            chat_background: Color::Reset,                           // transparent
+            chat_system:     Color::Rgb { r: 130, g: 130, b: 140 }, // muted grey
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ThemeColor → crossterm Color
+// ---------------------------------------------------------------------------
+
+/// Convert a `ThemeColor` to a `crossterm::Color` for the given depth.
+pub fn tc_to_color(tc: ThemeColor, depth: ColorDepth) -> Color {
+    if depth == ColorDepth::Monochrome {
+        return Color::Reset;
+    }
+    match tc {
+        ThemeColor::Default  => Color::Reset,
+        ThemeColor::White    => Color::White,
+        ThemeColor::Grey     => Color::Grey,
+        ThemeColor::DarkGrey => Color::DarkGrey,
+        ThemeColor::Black    => Color::Black,
+        ThemeColor::Cyan     => Color::Cyan,
+        ThemeColor::Green    => Color::Green,
+        ThemeColor::Yellow   => Color::Yellow,
+        ThemeColor::Magenta  => Color::Magenta,
+        ThemeColor::Blue     => Color::Blue,
+        ThemeColor::Red      => Color::Red,
     }
 }

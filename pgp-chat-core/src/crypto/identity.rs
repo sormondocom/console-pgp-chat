@@ -12,9 +12,10 @@ use std::io::Cursor;
 use pgp::{
     composed::{
         key::{SecretKeyParamsBuilder, SubkeyParamsBuilder},
-        Deserializable, KeyType, SignedPublicKey, SignedSecretKey,
+        Deserializable, KeyType, SignedPublicKey, SignedSecretKey, StandaloneSignature,
     },
     crypto::{ecc_curve::ECCCurve, hash::HashAlgorithm, sym::SymmetricKeyAlgorithm},
+    packet::{SignatureConfig, SignatureType, SignatureVersion},
     types::{CompressionAlgorithm, KeyTrait, SecretKeyTrait},
     ArmorOptions,
 };
@@ -22,6 +23,53 @@ use smallvec::smallvec;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
+
+// ---------------------------------------------------------------------------
+// Passphrase validation
+// ---------------------------------------------------------------------------
+
+/// Verify that `passphrase` correctly unlocks `secret_key`.
+///
+/// Signs a fixed test payload then immediately verifies the signature against
+/// `public_key`.  Two-step validation is necessary because rPGP 0.13 may not
+/// surface a wrong-passphrase error at signing time (S2K integrity is not
+/// always checked), but a garbage signature will always fail verification.
+///
+/// For unprotected keys (no S2K) every passphrase is accepted; callers should
+/// pass `Zeroizing::new(String::new())` for keys created without a passphrase.
+fn check_passphrase(
+    secret_key: &SignedSecretKey,
+    public_key: &SignedPublicKey,
+    passphrase:  &Zeroizing<String>,
+) -> Result<()> {
+    const TEST: &[u8] = b"pgp-chat-passphrase-check";
+    let pw = passphrase.clone();
+
+    let config = SignatureConfig::new_v4(
+        SignatureVersion::V4,
+        SignatureType::Binary,
+        secret_key.algorithm(),
+        HashAlgorithm::SHA2_256,
+        vec![],
+        vec![],
+    );
+
+    let sig = config
+        .sign(secret_key, move || pw.as_str().to_owned(), std::io::Cursor::new(TEST))
+        .map_err(|_| Error::PgpKeyParse(
+            "incorrect passphrase — the key could not be unlocked".to_string(),
+        ))?;
+
+    // If the passphrase was wrong, sign() may still "succeed" by producing a
+    // garbage signature.  Verification will catch it.
+    StandaloneSignature::new(sig)
+        .verify(public_key, TEST)
+        .map_err(|_| Error::PgpKeyParse(
+            "incorrect passphrase — key verification failed".to_string(),
+        ))?;
+
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Public type
@@ -33,6 +81,12 @@ use crate::error::{Error, Result};
 /// from memory when `PgpIdentity` is dropped.  The `SignedSecretKey` itself
 /// does not implement `ZeroizeOnDrop` in rPGP 0.13, but we zero the passphrase
 /// copy we hold so it cannot be recovered from a heap dump.
+///
+/// `Clone` is derived so the identity can be shared across multiple room
+/// sessions without re-loading or re-parsing the secret key from disk.
+/// Each clone holds its own `Zeroizing<String>` passphrase that is zeroed
+/// independently on drop.
+#[derive(Clone)]
 pub struct PgpIdentity {
     secret_key: SignedSecretKey,
     public_key: SignedPublicKey,
@@ -64,6 +118,14 @@ impl PgpIdentity {
     pub fn generate(nickname: &str, passphrase: Zeroizing<String>) -> Result<Self> {
         let user_id = format!("{} <{}@pgp-chat>", nickname, nickname.to_lowercase());
 
+        // Convert to Option<String> for the builder: None means no S2K protection.
+        // The builder uses this to encrypt the secret key material on disk.
+        let passphrase_opt: Option<String> = if passphrase.is_empty() {
+            None
+        } else {
+            Some(passphrase.as_str().to_owned())
+        };
+
         // Capture passphrase for use in closures — clone into Zeroizing wrappers
         // so the copies are also zeroed when they go out of scope.
         let pw_for_sign  = passphrase.clone();
@@ -86,10 +148,12 @@ impl PgpIdentity {
                 CompressionAlgorithm::ZLIB,
                 CompressionAlgorithm::ZIP,
             ])
+            .passphrase(passphrase_opt.clone())
             .subkeys(vec![
                 SubkeyParamsBuilder::default()
                     .key_type(KeyType::ECDH(ECCCurve::Curve25519))
                     .can_encrypt(true)
+                    .passphrase(passphrase_opt)
                     .build()
                     .map_err(|e| Error::PgpKeyFormat(e.to_string()))?,
             ])
@@ -165,6 +229,8 @@ impl PgpIdentity {
             .map(|u| u.id.id().to_string())
             .unwrap_or_else(|| format!("{} <{}@pgp-chat>", nickname, nickname.to_lowercase()));
 
+        check_passphrase(&signed_secret, &signed_public, &passphrase)?;
+
         Ok(Self {
             secret_key: signed_secret,
             public_key: signed_public,
@@ -199,6 +265,8 @@ impl PgpIdentity {
             .first()
             .map(|u| u.id.id().to_string())
             .unwrap_or_else(|| format!("{} <{}@pgp-chat>", nickname, nickname.to_lowercase()));
+
+        check_passphrase(&signed_secret, &signed_public, &passphrase)?;
 
         Ok(Self {
             secret_key: signed_secret,
