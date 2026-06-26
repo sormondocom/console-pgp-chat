@@ -37,11 +37,6 @@ jobs:
             binary: pgp-chat
             asset:  pgp-chat-macos-arm64
 
-          - os: macos-13           # Last Intel runner
-            target: x86_64-apple-darwin
-            binary: pgp-chat
-            asset:  pgp-chat-macos-x86_64
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
