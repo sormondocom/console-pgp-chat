@@ -1,4 +1,4 @@
-//! Live P2P chat: start a node, join rooms, chat in real time.
+//! Secure P2P chat session: start a node, join a room, exchange encrypted messages.
 //!
 //! Uses `tokio::select!` to poll both:
 //!   - `crossterm::event::EventStream` (keyboard input)
@@ -60,7 +60,18 @@ use crate::ui::Ui;
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<()> {
+/// Launch a chat session.
+///
+/// `direct` is `Some((room, bootstrap_addr))` when called from the peer
+/// scanner — the room and the peer's address are already known, so the
+/// interactive room-selection and bootstrap-address prompts are skipped.
+/// Pass `None` for the normal menu flow.
+pub async fn run(
+    ui:          &Ui,
+    storage_dir: &Path,
+    config:      &AppConfig,
+    direct:      Option<(PersistedRoom, Option<libp2p::Multiaddr>)>,
+) -> Result<()> {
     // Apply the active theme's system-message color for this session.
     set_system_color(ui.renderer.palette().chat_system);
 
@@ -95,28 +106,35 @@ pub async fn run(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<()> 
     let port_str = ui.prompt("Listen port [0 = random]:")?;
     let port: u16 = port_str.trim().parse().unwrap_or(0);
 
-    // Show the room list (or a first-run prompt) so the user picks where to go.
-    let (initial_room, initial_passphrase, initial_is_owner) =
-        match select_room_at_startup(ui, &known_rooms)? {
-            Some(r) => r,
-            None    => return Ok(()),
-        };
-
-    let bootstrap_input = ui.prompt("Bootstrap peer multiaddr [leave blank to skip]:")?;
-    let bootstrap_addr: Option<libp2p::Multiaddr> = if bootstrap_input.trim().is_empty() {
-        None
-    } else {
-        match bootstrap_input.trim().parse::<libp2p::Multiaddr>() {
-            Ok(addr) => {
-                ui.success(&format!("Dialling {}", addr))?;
-                Some(addr)
+    // ── Room + bootstrap — interactive prompts or pre-selected from scanner ─
+    let (initial_room, initial_passphrase, initial_is_owner, bootstrap_addr) =
+        if let Some((room, bootstrap)) = direct {
+            // Peer scanner handed us the room and the peer's address.
+            println!("  Room: {}  [{}]\r",
+                room.name,
+                if room.is_owner { "owner" } else { "member" });
+            if let Some(ref addr) = bootstrap {
+                println!("  Bootstrap: {} (from peer scanner)\r", addr);
             }
-            Err(_) => {
-                ui.error("Invalid multiaddr — skipping bootstrap")?;
+            (room.name, Zeroizing::new(room.passphrase), room.is_owner, bootstrap)
+        } else {
+            // Normal menu flow: interactive room selection then bootstrap prompt.
+            let (room_name, pass, is_owner) =
+                match select_room_at_startup(ui, &known_rooms)? {
+                    Some(r) => r,
+                    None    => return Ok(()),
+                };
+            let bootstrap_input = ui.prompt("Bootstrap peer multiaddr [leave blank to skip]:")?;
+            let addr = if bootstrap_input.trim().is_empty() {
                 None
-            }
-        }
-    };
+            } else {
+                match bootstrap_input.trim().parse::<libp2p::Multiaddr>() {
+                    Ok(a)  => { ui.success(&format!("Dialling {}", a))?; Some(a) }
+                    Err(_) => { ui.error("Invalid multiaddr — skipping bootstrap")?; None }
+                }
+            };
+            (room_name, pass, is_owner, addr)
+        };
 
     // ── Room-switching outer loop ──────────────────────────────────────────
     let mut current_room = initial_room;
@@ -567,7 +585,7 @@ pub async fn run(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<()> 
                                                                     let _ = handle.cmd_tx.send(RoomCommand::Disconnect).await;
                                                                 }
                                                             } else {
-                                                                let (pass, is_owner) = prompt_new_room_passphrase(ui, &name)?;
+                                                                let (pass, is_owner) = generate_room_passphrase(ui, &name)?;
                                                                 known_rooms.push(PersistedRoom {
                                                                     name:       name.clone(),
                                                                     passphrase: pass.as_str().to_owned(),
@@ -887,22 +905,35 @@ fn select_room_at_startup(
     known_rooms: &[PersistedRoom],
 ) -> Result<Option<(String, Zeroizing<String>, bool)>> {
     if known_rooms.is_empty() {
-        // First run — no rooms yet.
+        // No rooms saved yet — prompt to create or join one.
         println!("\r");
-        println!("  No rooms in your list yet.  Let's set up your first room.\r");
-        let room_input = ui.prompt("Room name [default: main]:")?;
-        if room_input.trim().is_empty() {
-            // Esc / blank at the very first prompt → back to main menu.
-            return Ok(None);
-        }
-        let name = room_input.trim().to_string();
+        println!("  No rooms saved yet.  Add them via [3] Manage Rooms, or set one up now:\r");
         println!("\r");
-        println!("  Room passphrase — encrypts ALL traffic in this room with AES-256.\r");
-        println!("  Share it out-of-band with your peers before they join.\r");
-        println!("  Leave blank to generate one (you become the room owner).\r");
-        println!("  Enter an existing passphrase if someone else created this room.\r");
-        let (pass, is_owner) = prompt_new_room_passphrase(ui, &name)?;
-        return Ok(Some((name, pass, is_owner)));
+        print_system("  [c] Create room  (generates a passphrase — you become the owner)")?;
+        print_system("  [j] Join room    (enter a passphrase the room owner shared with you)")?;
+        print_system("  [0] Back to menu")?;
+        let action = ui.prompt("Choice:")?;
+        return match action.trim().to_lowercase().as_str() {
+            "c" => {
+                let room_input = ui.prompt("Room name:")?;
+                let name = room_input.trim().to_string();
+                if name.is_empty() { return Ok(None); }
+                let (pass, is_owner) = generate_room_passphrase(ui, &name)?;
+                Ok(Some((name, pass, is_owner)))
+            }
+            "j" => {
+                let room_input = ui.prompt("Room name:")?;
+                let name = room_input.trim().to_string();
+                if name.is_empty() { return Ok(None); }
+                let pass = ui.prompt_password("Room passphrase:")?;
+                if pass.is_empty() {
+                    print_system("A passphrase is required to join a room.")?;
+                    return Ok(None);
+                }
+                Ok(Some((name, pass, false)))
+            }
+            _ => Ok(None),
+        };
     }
 
     // Show existing rooms.
@@ -912,7 +943,8 @@ fn select_room_at_startup(
             let role = if r.is_owner { "owner" } else { "member" };
             print_system(&format!("  [{}] {}  ({})", i + 1, r.name, role))?;
         }
-        print_system("  [n] Create / join a new room")?;
+        print_system("  [c] Create a new room")?;
+        print_system("  [j] Join an existing room")?;
         print_system("─────────────────────────────────────────────────────────")?;
 
         let choice = ui.prompt("Choice:")?;
@@ -922,30 +954,41 @@ fn select_room_at_startup(
             return Ok(None);
         }
 
-        if choice.eq_ignore_ascii_case("n") {
+        if choice.eq_ignore_ascii_case("c") {
             let room_input = ui.prompt("Room name:")?;
             let name = room_input.trim().to_string();
             if name.is_empty() {
                 print_system("No name entered — try again.")?;
                 continue;
             }
-            // If already known, require passphrase to re-enter.
+            let (pass, is_owner) = generate_room_passphrase(ui, &name)?;
+            return Ok(Some((name, pass, is_owner)));
+        }
+
+        if choice.eq_ignore_ascii_case("j") {
+            let room_input = ui.prompt("Room name:")?;
+            let name = room_input.trim().to_string();
+            if name.is_empty() {
+                print_system("No name entered — try again.")?;
+                continue;
+            }
+            // If already saved, require stored passphrase (re-entering a known room).
             if let Some(r) = known_rooms.iter().find(|r| r.name == name) {
                 let stored   = r.passphrase.clone();
                 let is_owner = r.is_owner;
-                println!("\r");
-                let entered = ui.prompt_password("Room passphrase:")?;
+                let entered  = ui.prompt_password("Room passphrase:")?;
                 if entered.as_str() != stored {
                     print_system("Incorrect passphrase — try again.")?;
                     continue;
                 }
                 return Ok(Some((name, Zeroizing::new(stored), is_owner)));
             }
-            println!("\r");
-            println!("  Leave passphrase blank to GENERATE one (you become room owner).\r");
-            println!("  Enter an EXISTING passphrase if someone else created this room.\r");
-            let (pass, is_owner) = prompt_new_room_passphrase(ui, &name)?;
-            return Ok(Some((name, pass, is_owner)));
+            let pass = ui.prompt_password("Room passphrase (from room owner):")?;
+            if pass.is_empty() {
+                print_system("A passphrase is required to join a room.")?;
+                continue;
+            }
+            return Ok(Some((name, pass, false)));
         }
 
         if let Ok(idx) = choice.parse::<usize>() {
@@ -1051,7 +1094,7 @@ fn manage_rooms(
             println!("\r");
             println!("  Leave passphrase blank to GENERATE one (you become room owner).\r");
             println!("  Enter an EXISTING passphrase if someone else created this room.\r");
-            let (pass, is_owner) = prompt_new_room_passphrase(ui, &name)?;
+            let (pass, is_owner) = generate_room_passphrase(ui, &name)?;
             // Caller is responsible for pushing to known_rooms and saving.
             return Ok(RoomAction::Switch(name, pass, is_owner));
         }
@@ -1143,28 +1186,19 @@ fn manage_rooms(
 ///
 /// Returns `(passphrase, is_owner)`.
 ///
-/// - Blank input → generate a cryptographically random 128-bit passphrase
-///   and mark this client as the room owner.
-/// - Non-blank input → use the entered value and mark this client as a
-///   non-owner (they were given the passphrase by someone else).
-fn prompt_new_room_passphrase(ui: &Ui, room_name: &str) -> Result<(Zeroizing<String>, bool)> {
-    let input = ui.prompt_password(
-        &format!("Room passphrase for '{}' [blank = generate / enter existing]:", room_name),
-    )?;
-
-    if input.is_empty() {
-        // Generate a random passphrase — this client is creating the room.
-        let mut raw = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut raw);
-        let generated = hex::encode(raw);
-        println!("\r");
-        ui.show_passphrase_box("Generated Room Passphrase (you are the owner)", &generated);
-        println!("  Share this with peers BEFORE they join.  Anyone without it cannot read room traffic.\r");
-        Ok((Zeroizing::new(generated), true))
-    } else {
-        // User entered a passphrase — they are joining someone else's room.
-        Ok((input, false))
-    }
+/// Generate a random 128-bit room passphrase, display it, and return it.
+/// The caller is always the room owner when this path is taken.
+fn generate_room_passphrase(ui: &Ui, room_name: &str) -> Result<(Zeroizing<String>, bool)> {
+    let mut raw = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut raw);
+    let generated = hex::encode(raw);
+    println!("\r");
+    ui.show_passphrase_box(
+        &format!("Passphrase for '{}' — share with peers before they join", room_name),
+        &generated,
+    );
+    println!("  Anyone without this passphrase cannot read room traffic.\r");
+    Ok((Zeroizing::new(generated), true))
 }
 
 // ---------------------------------------------------------------------------

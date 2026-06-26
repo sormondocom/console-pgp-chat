@@ -15,6 +15,7 @@ enum MenuItem {
     StartChat,
     ManageIdentities,
     ManageRooms,
+    ScanPeers,
     Settings,
     Exit,
 }
@@ -28,8 +29,9 @@ struct MenuEntry {
 const ENTRIES: &[MenuEntry] = &[
     MenuEntry { key: '1', label: "Start Chat",         desc: "Connect to a room and exchange encrypted messages" },
     MenuEntry { key: '2', label: "Manage Identities",  desc: "Create, import, switch, or delete PGP identities" },
-    MenuEntry { key: '3', label: "Manage Rooms",       desc: "Add, rename, update passphrase, or forget rooms" },
-    MenuEntry { key: '4', label: "Settings",           desc: "Configure file paths and defaults" },
+    MenuEntry { key: '3', label: "Manage Rooms",       desc: "Create rooms or join rooms shared by others" },
+    MenuEntry { key: '4', label: "Scan for Peers",     desc: "Discover pgp-chat nodes on the network (no trust required)" },
+    MenuEntry { key: '5', label: "Settings",           desc: "Configure file paths and chat color theme" },
     MenuEntry { key: 'q', label: "Quit",               desc: "" },
 ];
 
@@ -52,13 +54,16 @@ pub async fn run() -> Result<()> {
 
         let result = match selected {
             MenuItem::StartChat => {
-                commands::network_demo::run(&ui, &storage_dir, &config).await
+                commands::chat::run(&ui, &storage_dir, &config, None).await
             }
             MenuItem::ManageIdentities => {
                 commands::identity_manager::run(&ui, &storage_dir, &mut config)
             }
             MenuItem::ManageRooms => {
                 commands::room_manager::run(&ui, &storage_dir)
+            }
+            MenuItem::ScanPeers => {
+                commands::peer_scanner::run(&ui, &storage_dir, &config).await
             }
             MenuItem::Settings => {
                 commands::settings::run(&ui, &storage_dir, &mut config)
@@ -104,7 +109,8 @@ fn wait_for_selection() -> Result<MenuItem> {
                 KeyCode::Char('1') => Some(MenuItem::StartChat),
                 KeyCode::Char('2') => Some(MenuItem::ManageIdentities),
                 KeyCode::Char('3') => Some(MenuItem::ManageRooms),
-                KeyCode::Char('4') => Some(MenuItem::Settings),
+                KeyCode::Char('4') => Some(MenuItem::ScanPeers),
+                KeyCode::Char('5') => Some(MenuItem::Settings),
                 KeyCode::Char('q') | KeyCode::Esc => Some(MenuItem::Exit),
                 _ => None,
             };

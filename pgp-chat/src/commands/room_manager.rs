@@ -29,7 +29,8 @@ pub fn run(ui: &Ui, storage_dir: &Path) -> Result<()> {
         }
 
         ui.renderer.draw_box_separator()?;
-        println!("  [n] Add room\r");
+        println!("  [c] Create Room   (generate passphrase — you become the owner)\r");
+        println!("  [j] Join Room     (enter a passphrase someone shared with you)\r");
         if !rooms.is_empty() {
             println!("  Enter a number to view / edit details\r");
             println!("  [f] Forget a room\r");
@@ -43,7 +44,8 @@ pub fn run(ui: &Ui, storage_dir: &Path) -> Result<()> {
 
         match choice.as_str() {
             "0" | "" => return Ok(()),
-            "n"      => add_room(ui, storage_dir, &rooms)?,
+            "c"      => create_room(ui, storage_dir, &rooms)?,
+            "j"      => join_room(ui, storage_dir, &rooms)?,
             "f" if !rooms.is_empty() => forget_room(ui, storage_dir, &rooms)?,
             _ => {
                 if let Ok(idx) = choice.parse::<usize>() {
@@ -63,54 +65,91 @@ pub fn run(ui: &Ui, storage_dir: &Path) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Add a room
+// Create a new room (owner generates the passphrase)
 // ---------------------------------------------------------------------------
 
-fn add_room(ui: &Ui, storage_dir: &Path, existing: &[PersistedRoom]) -> Result<()> {
-    ui.renderer.draw_box_top("Add Room")?;
-    println!("  Leave passphrase blank to GENERATE one (you become the room owner).\r");
-    println!("  Enter an existing passphrase if someone else created the room.\r");
+fn create_room(ui: &Ui, storage_dir: &Path, existing: &[PersistedRoom]) -> Result<()> {
+    ui.renderer.draw_box_top("Create Room")?;
+    println!("  A random passphrase will be generated for you.\r");
+    println!("  Share it out-of-band with peers before they try to join.\r");
     println!("\r");
 
-    let name = ui.prompt("Room name:")?;
+    let name = prompt_unique_room_name(ui, existing)?;
+    if name.is_empty() {
+        return Ok(());
+    }
+
+    let mut raw = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut raw);
+    let passphrase = hex::encode(raw);
+
+    println!("\r");
+    ui.show_passphrase_box("Room Passphrase — share this with your peers", &passphrase);
+    println!("  Anyone without this passphrase cannot read room traffic.\r");
+
+    let mut rooms = persistence::load_rooms(storage_dir);
+    rooms.push(PersistedRoom { name: name.clone(), passphrase, is_owner: true });
+    persistence::save_rooms(storage_dir, &rooms)
+        .with_context(|| "Failed to save rooms")?;
+
+    ui.success(&format!("Room '{}' created — you are the owner.", name))?;
+    ui.wait_for_key("Press any key to continue...")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Join an existing room (member enters the owner's passphrase)
+// ---------------------------------------------------------------------------
+
+fn join_room(ui: &Ui, storage_dir: &Path, existing: &[PersistedRoom]) -> Result<()> {
+    ui.renderer.draw_box_top("Join Room")?;
+    println!("  Enter the room name and passphrase that the room owner shared with you.\r");
+    println!("\r");
+
+    let name = prompt_unique_room_name(ui, existing)?;
+    if name.is_empty() {
+        return Ok(());
+    }
+
+    let input = ui.prompt_password("Room passphrase:")?;
+    if input.is_empty() {
+        ui.error("A passphrase is required to join a room. Use [c] to create a new room instead.")?;
+        ui.wait_for_key("Press any key...")?;
+        return Ok(());
+    }
+
+    let mut rooms = persistence::load_rooms(storage_dir);
+    rooms.push(PersistedRoom {
+        name:       name.clone(),
+        passphrase: input.as_str().to_owned(),
+        is_owner:   false,
+    });
+    persistence::save_rooms(storage_dir, &rooms)
+        .with_context(|| "Failed to save rooms")?;
+
+    ui.success(&format!("Room '{}' saved — you are a member.", name))?;
+    ui.wait_for_key("Press any key to continue...")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared helper — prompt for a room name that doesn't already exist
+// ---------------------------------------------------------------------------
+
+fn prompt_unique_room_name(ui: &Ui, existing: &[PersistedRoom]) -> Result<String> {
+    let name = ui.prompt("Room name [blank to cancel]:")?;
     let name = name.trim().to_string();
     if name.is_empty() {
         println!("  Cancelled.\r");
         ui.wait_for_key("Press any key...")?;
-        return Ok(());
+        return Ok(String::new());
     }
-
     if existing.iter().any(|r| r.name == name) {
-        ui.error(&format!("Room '{}' is already in your list.", name))?;
+        ui.error(&format!("'{}' is already in your room list.", name))?;
         ui.wait_for_key("Press any key...")?;
-        return Ok(());
+        return Ok(String::new());
     }
-
-    let input = ui.prompt_password(
-        &format!("Room passphrase for '{}' [blank = generate]:", name),
-    )?;
-
-    let (passphrase, is_owner) = if input.is_empty() {
-        let mut raw = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut raw);
-        let generated = hex::encode(raw);
-        println!("\r");
-        ui.show_passphrase_box("Generated Room Passphrase (you are the owner)", &generated);
-        println!("  Share this with peers BEFORE they join.\r");
-        (generated, true)
-    } else {
-        (input.as_str().to_owned(), false)
-    };
-
-    let mut rooms = persistence::load_rooms(storage_dir);
-    rooms.push(PersistedRoom { name: name.clone(), passphrase, is_owner });
-    persistence::save_rooms(storage_dir, &rooms)
-        .with_context(|| "Failed to save rooms")?;
-
-    let role = if is_owner { "owner" } else { "member" };
-    ui.success(&format!("Room '{}' added ({}).", name, role))?;
-    ui.wait_for_key("Press any key to continue...")?;
-    Ok(())
+    Ok(name)
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
+pub mod chat;
 pub mod identity_manager;
-pub mod network_demo;
+pub mod peer_scanner;
 pub mod room_manager;
 pub mod settings;
