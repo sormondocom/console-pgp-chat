@@ -1,8 +1,11 @@
 name: Release
 
-# Runs when a version tag (e.g. v1.2.3) is pushed, which GitHub also does
-# automatically when you create a release through the web UI.
+# Fires when a release is published through the GitHub UI (or the API/CLI).
+# Also fires on a plain tag push (e.g. git push origin v1.2.3) so both
+# workflows — UI release and CLI tag — are covered.
 on:
+  release:
+    types: [published]
   push:
     tags:
       - 'v*.*.*'
