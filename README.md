@@ -5,6 +5,7 @@
 > **Peer-to-peer, end-to-end encrypted chat — no servers, no surveillance, no trust required.**
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/sormondocom)
+[![Latest Release](https://img.shields.io/github/v/release/sormondocom/console-pgp-chat?style=for-the-badge&label=Latest%20Release&color=2ea44f)](https://github.com/sormondocom/console-pgp-chat/releases/latest)
 
 ---
 
