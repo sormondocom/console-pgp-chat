@@ -29,7 +29,7 @@ pub fn run(ui: &Ui, storage_dir: &Path) -> Result<()> {
         }
 
         ui.renderer.draw_box_separator()?;
-        println!("  [c] Create Room   (generate passphrase — you become the owner)\r");
+        println!("  [c] Create Room   (set or generate a passphrase — you become the owner)\r");
         println!("  [j] Join Room     (enter a passphrase someone shared with you)\r");
         if !rooms.is_empty() {
             println!("  Enter a number to view / edit details\r");
@@ -65,12 +65,12 @@ pub fn run(ui: &Ui, storage_dir: &Path) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Create a new room (owner generates the passphrase)
+// Create a new room (owner sets or generates the passphrase)
 // ---------------------------------------------------------------------------
 
 fn create_room(ui: &Ui, storage_dir: &Path, existing: &[PersistedRoom]) -> Result<()> {
     ui.renderer.draw_box_top("Create Room")?;
-    println!("  A random passphrase will be generated for you.\r");
+    println!("  You can choose your own passphrase or let the app generate one.\r");
     println!("  Share it out-of-band with peers before they try to join.\r");
     println!("\r");
 
@@ -79,9 +79,15 @@ fn create_room(ui: &Ui, storage_dir: &Path, existing: &[PersistedRoom]) -> Resul
         return Ok(());
     }
 
-    let mut raw = [0u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut raw);
-    let passphrase = hex::encode(raw);
+    println!("\r");
+    let input = ui.prompt_password("Room passphrase [blank = generate one]:")?;
+    let passphrase = if input.is_empty() {
+        let mut raw = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut raw);
+        hex::encode(raw)
+    } else {
+        input.as_str().to_owned()
+    };
 
     println!("\r");
     ui.show_passphrase_box("Room Passphrase — share this with your peers", &passphrase);
