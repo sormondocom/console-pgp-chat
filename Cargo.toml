@@ -29,7 +29,7 @@ smallvec = { version = "1", features = ["serde"] }
 
 # P2P networking — TCP + QUIC/UDP transports.
 # QUIC traffic resembles TLS 1.3/HTTPS for protocol-level camouflage.
-# Chat uses Kademlia + Identify for discovery (mDNS unreliable on Windows).
+# Chat uses Kademlia + Identify for discovery; mDNS for local broadcasting.
 # Scanner uses mDNS for zero-config local discovery (best-effort only).
 libp2p = { version = "0.54", default-features = false, features = [
     "tokio", "tcp", "quic", "noise", "yamux",

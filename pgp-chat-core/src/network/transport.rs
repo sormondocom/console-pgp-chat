@@ -15,15 +15,16 @@
 //!
 //! ```text
 //!  Gossipsub  — room broadcast (all payloads room-symmetric-encrypted)
-//!  Kademlia   — distributed peer discovery (no mDNS; unreliable on Windows)
+//!  Kademlia   — distributed peer discovery (DHT, works across subnets)
 //!  Identify   — multiaddr exchange so Kademlia can populate its routing table
+//!  mDNS       — local network broadcasting so scanner can find active chatters
 //! ```
 
 use std::time::Duration;
 
 use sha2::{Sha256, Digest};
 use libp2p::{
-    gossipsub, identify, kad, noise, tcp, yamux,
+    gossipsub, identify, kad, mdns, noise, tcp, yamux,
     identity::Keypair,
     swarm::Swarm,
     SwarmBuilder,
@@ -117,7 +118,15 @@ pub fn build_swarm(keypair: Keypair) -> Result<Swarm<ChatBehaviour>> {
                 .with_agent_version(format!("pgp-chat/{}", env!("CARGO_PKG_VERSION"))),
             );
 
-            Ok(ChatBehaviour { gossipsub, kademlia, identify })
+            // --- mDNS -----------------------------------------------------
+            // Chat nodes broadcast via mDNS so the peer scanner can find them
+            // even while they are in an active room session.
+            let mdns = mdns::tokio::Behaviour::new(
+                mdns::Config::default(),
+                key.public().to_peer_id(),
+            ).map_err(|e| Error::Network(e.to_string()))?;
+
+            Ok(ChatBehaviour { gossipsub, kademlia, identify, mdns })
         })
         .map_err(|e| Error::Network(e.to_string()))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT))

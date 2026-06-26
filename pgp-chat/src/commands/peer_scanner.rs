@@ -523,6 +523,35 @@ async fn run_scanner(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<
                             if let Some(sw) = swarm.as_mut() { let _ = sw.dial(addr); }
                         }
                     }
+
+                    // ── mDNS expired — remove stale peer entries ──────────
+                    // Without this, peers that go offline or switch sessions
+                    // (getting a new ephemeral PeerId) linger in the list.
+                    SwarmEvent::Behaviour(ScannerBehaviourEvent::Mdns(
+                        mdns::Event::Expired(list)
+                    )) => {
+                        for (peer_id, _) in list {
+                            let was_pgp = peers.get(&peer_id)
+                                .map(|p| p.is_pgp_chat()).unwrap_or(false);
+                            peers.remove(&peer_id);
+                            peer_order.retain(|pid| pid != &peer_id);
+                            if was_pgp {
+                                let pgp_list = pgp_peers(&peer_order, &peers);
+                                if pgp_list.is_empty() {
+                                    selected_idx = 0;
+                                    scroll = 0;
+                                } else {
+                                    let max = max_visible(term_h);
+                                    selected_idx = selected_idx.min(pgp_list.len() - 1);
+                                    if scroll > 0 && scroll + max > pgp_list.len() {
+                                        scroll = pgp_list.len().saturating_sub(max);
+                                    }
+                                }
+                                draw_peer_area(ui, &pgp_list, selected_idx, scroll, term_h, &room_by_hash)?;
+                                stdout().flush()?;
+                            }
+                        }
+                    }
                     SwarmEvent::Behaviour(ScannerBehaviourEvent::Identify(
                         identify::Event::Received { peer_id, info, .. }
                     )) => {
