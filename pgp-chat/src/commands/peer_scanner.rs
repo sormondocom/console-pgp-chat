@@ -355,7 +355,7 @@ pub async fn run(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<()> 
 }
 
 async fn run_scanner(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<()> {
-    let saved_rooms  = persistence::load_rooms(storage_dir);
+    let saved_rooms  = persistence::load_rooms(storage_dir, None);
     let room_by_hash: HashMap<String, String> = saved_rooms.iter()
         .map(|r| (IdentTopic::new(&r.name).hash().to_string(), r.name.clone()))
         .collect();

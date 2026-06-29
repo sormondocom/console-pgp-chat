@@ -7,8 +7,17 @@
 //! ~/.pgp-chat/             (Unix / macOS)
 //!   identity.asc   ← ASCII-armoured secret key (passphrase-protected by user)
 //!   contacts.json  ← trusted peer public keys + rejected fingerprints
-//!   rooms.json     ← ordered list of room names previously joined (no passphrases)
+//!   rooms.json     ← room names + passphrases (AES-256 room keys — protect this file!)
 //! ```
+//!
+//! ## Security note
+//!
+//! `rooms.json` stores each room's AES-256 passphrase encrypted with the user's
+//! PGP identity key (prefix `pgpenc:`).  An attacker who steals `rooms.json`
+//! cannot decrypt room traffic without also obtaining the identity secret key
+//! *and* cracking its PGP passphrase.  On Unix the file is created with mode
+//! 0600 (owner-readable only).  On Windows, restrict access to the
+//! `%APPDATA%\pgp-chat\` directory.
 //!
 //! The secret key is protected by the user's chosen passphrase.  The contacts
 //! file contains only public keys so it carries no secret material.
@@ -18,9 +27,54 @@ use std::io::Cursor;
 
 use chrono::{DateTime, Utc};
 use pgp::composed::{Deserializable, SignedPublicKey};
+use zeroize::Zeroize;
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::{encrypt, identity::PgpIdentity};
 use crate::error::{Error, Result};
+
+// ---------------------------------------------------------------------------
+// Room passphrase encryption helpers
+// ---------------------------------------------------------------------------
+
+/// Prefix written in front of PGP-encrypted room passphrases in `rooms.json`.
+pub const PASSPHRASE_ENC_PREFIX: &str = "pgpenc:";
+
+/// Returns `true` when `stored` is a PGP-encrypted passphrase written by
+/// [`encrypt_room_passphrase`].
+pub fn passphrase_is_encrypted(stored: &str) -> bool {
+    stored.starts_with(PASSPHRASE_ENC_PREFIX)
+}
+
+/// Encrypt a room passphrase to `identity`'s public key.
+///
+/// Returns `"pgpenc:" + hex(PGP packet bytes)` on success.
+pub fn encrypt_room_passphrase(pass: &str, identity: &PgpIdentity) -> Result<String> {
+    let bytes = encrypt::encrypt_for_recipients(pass.as_bytes(), &[identity.public_key()])?;
+    Ok(format!("{}{}", PASSPHRASE_ENC_PREFIX, hex::encode(bytes)))
+}
+
+/// Decrypt a room passphrase that was stored by [`encrypt_room_passphrase`].
+///
+/// If `stored` does not carry the `pgpenc:` prefix (old plaintext format or
+/// a newly-entered value not yet encrypted) the original string is returned
+/// unchanged so callers are migration-transparent.
+///
+/// Returns the original string if decryption fails, so callers don't need to
+/// handle the error path specially when reading legacy data.
+pub fn decrypt_room_passphrase(stored: &str, identity: &PgpIdentity) -> String {
+    stored.strip_prefix(PASSPHRASE_ENC_PREFIX)
+        .and_then(|hex_part| hex::decode(hex_part).ok())
+        .and_then(|bytes| {
+            encrypt::decrypt_message(
+                &bytes,
+                identity.secret_key(),
+                identity.passphrase_fn(),
+            ).ok()
+        })
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| stored.to_string())
+}
 
 // ---------------------------------------------------------------------------
 // Serialisable structs
@@ -179,6 +233,9 @@ pub struct PersistedRoom {
     /// Gossipsub topic / display name.
     pub name: String,
     /// AES-256 room passphrase (symmetric, shared out-of-band).
+    /// On disk this is PGP-encrypted and prefixed with `pgpenc:` when an
+    /// identity is available at save time.  In memory it holds the plaintext
+    /// value so the rest of the code can use it directly.
     pub passphrase: String,
     /// `true` when this client initiated the room (generated / chose the
     /// first passphrase).  `false` for rooms joined with a passphrase that
@@ -186,31 +243,96 @@ pub struct PersistedRoom {
     pub is_owner: bool,
 }
 
+impl Drop for PersistedRoom {
+    fn drop(&mut self) {
+        self.passphrase.zeroize();
+    }
+}
+
 /// Load the persisted room list from `{dir}/rooms.json`.
 ///
+/// When `identity` is `Some`, passphrases that carry the `pgpenc:` prefix are
+/// decrypted using that identity's secret key so callers always receive the
+/// plaintext value in `PersistedRoom::passphrase`.
+///
+/// When `identity` is `None` the raw stored value is returned — useful when
+/// only `PersistedRoom::name` is needed (e.g. the peer scanner).
+///
 /// Returns an empty list if the file does not exist or cannot be parsed.
-pub fn load_rooms(dir: &Path) -> Vec<PersistedRoom> {
+pub fn load_rooms(dir: &Path, identity: Option<&PgpIdentity>) -> Vec<PersistedRoom> {
     let path = rooms_path(dir);
     if !path.exists() {
         return Vec::new();
     }
-    std::fs::read_to_string(&path)
+    let raw: Vec<PersistedRoom> = std::fs::read_to_string(&path)
         .ok()
-        .and_then(|s| serde_json::from_str::<Vec<PersistedRoom>>(&s).ok())
-        .unwrap_or_default()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    if let Some(id) = identity {
+        raw.into_iter().map(|r| PersistedRoom {
+            name:       r.name.clone(),
+            passphrase: decrypt_room_passphrase(&r.passphrase, id),
+            is_owner:   r.is_owner,
+        }).collect()
+    } else {
+        raw
+    }
 }
 
 /// Save the room list to `{dir}/rooms.json`.
 ///
+/// When `identity` is `Some`, each room passphrase that is not already
+/// encrypted is PGP-encrypted to that identity's public key before writing.
+/// Passphrases that already carry the `pgpenc:` prefix are left as-is (they
+/// were encrypted on a previous save to the same key).
+///
+/// When `identity` is `None` the plaintext values are written unchanged —
+/// useful from the room manager which doesn't hold a loaded identity; the chat
+/// session will re-encrypt on its next save.
+///
 /// Uses an atomic write-then-rename so a crash never leaves a partial file.
-pub fn save_rooms(dir: &Path, rooms: &[PersistedRoom]) -> std::io::Result<()> {
+pub fn save_rooms(
+    dir:      &Path,
+    rooms:    &[PersistedRoom],
+    identity: Option<&PgpIdentity>,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let json = serde_json::to_string_pretty(rooms)
+
+    let rooms_on_disk: Vec<PersistedRoom> = if let Some(id) = identity {
+        rooms.iter().map(|r| {
+            let pass = if passphrase_is_encrypted(&r.passphrase) {
+                r.passphrase.clone()
+            } else {
+                encrypt_room_passphrase(&r.passphrase, id)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+            };
+            Ok(PersistedRoom {
+                name:       r.name.clone(),
+                passphrase: pass,
+                is_owner:   r.is_owner,
+            })
+        }).collect::<std::io::Result<Vec<_>>>()?
+    } else {
+        rooms.to_vec()
+    };
+
+    let json = serde_json::to_string_pretty(&rooms_on_disk)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let path = rooms_path(dir);
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, &path)?;
+
+    // Restrict read access on Unix — rooms.json contains AES-256 room keys.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms)?;
+    }
+
     Ok(())
 }
 

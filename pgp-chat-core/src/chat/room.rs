@@ -642,7 +642,35 @@ impl ChatRoom {
                     _ => {}
                 }
 
-                // Forward raw decrypted payload to UI for display.
+                // ── PGP per-recipient decryption ──────────────────────────
+                // If the inner payload is PGP-encrypted, attempt to decrypt it
+                // with our private key.  On success, rebuild the SignedChatMessage
+                // with the plaintext kind so the UI can display the message.
+                // On failure (message was not addressed to us), pass the ciphertext
+                // through unchanged — the UI shows a "received encrypted" notice.
+                let payload_for_ui = if let MessageKind::Encrypted { ref ciphertext, .. } = signed.message.kind {
+                    match encrypt::decrypt_message(
+                        ciphertext,
+                        self.identity.secret_key(),
+                        self.identity.passphrase_fn(),
+                    ) {
+                        Ok(plaintext_bytes) => {
+                            match String::from_utf8(plaintext_bytes) {
+                                Ok(text) => {
+                                    let mut display = signed.clone();
+                                    display.message.kind = MessageKind::Plaintext(text);
+                                    serde_json::to_vec(&display).unwrap_or(decrypted_bytes)
+                                }
+                                Err(_) => decrypted_bytes, // Shouldn't happen; pass through
+                            }
+                        }
+                        Err(_) => decrypted_bytes, // Not encrypted to us
+                    }
+                } else {
+                    decrypted_bytes
+                };
+
+                // Forward to UI for display.
                 // `verified` tells the UI whether the sender's PGP signature
                 // checked out against a trusted key — it MUST show a visual
                 // warning for unverified senders to prevent nick spoofing.
@@ -651,7 +679,7 @@ impl ChatRoom {
                     .send(ChatNetEvent::MessageReceived {
                         from:     propagation_source,
                         topic,
-                        payload:  decrypted_bytes,
+                        payload:  payload_for_ui,
                         verified,
                     })
                     .await;
@@ -886,7 +914,15 @@ impl ChatRoom {
         }
 
         let recipient_count = recipients.len();
-        let ciphertext = encrypt::encrypt_for_recipients(body.as_bytes(), &recipients)?;
+
+        // Include our own public key so we can decrypt echoed messages.
+        // `recipient_count` intentionally excludes self — it reflects the number
+        // of trusted peers the message was addressed to, for display purposes.
+        let own_key = self.identity.public_key();
+        let mut all_recipients = recipients;
+        all_recipients.push(own_key);
+
+        let ciphertext = encrypt::encrypt_for_recipients(body.as_bytes(), &all_recipients)?;
 
         // Pass only the count — never the fingerprints.  Putting the full
         // recipient list on the wire would let anyone with the room passphrase

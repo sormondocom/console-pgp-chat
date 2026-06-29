@@ -41,13 +41,14 @@ pub fn run(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<()> {
                     i + 1, e.name, e.nickname, fp_short, active
                 );
             }
+            println!("\r");
+            println!("  Enter a number to view details / set as active\r");
         }
 
         ui.renderer.draw_box_separator()?;
         println!("  [n] New identity\r");
         println!("  [i] Import existing PGP secret key\r");
         if !entries.is_empty() {
-            println!("  Enter a number to view details / set as active\r");
             println!("  [d] Delete an identity\r");
         }
         println!("  [0] Back\r");

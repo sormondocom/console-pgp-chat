@@ -100,7 +100,7 @@ pub async fn run(
     }
 
     // ── Load known rooms ───────────────────────────────────────────────────
-    let mut known_rooms: Vec<PersistedRoom> = persistence::load_rooms(&storage_dir);
+    let mut known_rooms: Vec<PersistedRoom> = persistence::load_rooms(&storage_dir, Some(&pgp_identity));
 
     // ── One-time network config ────────────────────────────────────────────
     let port_str = ui.prompt("Listen port [0 = random]:")?;
@@ -116,7 +116,12 @@ pub async fn run(
             if let Some(ref addr) = bootstrap {
                 println!("  Bootstrap: {} (from peer scanner)\r", addr);
             }
-            (room.name, Zeroizing::new(room.passphrase), room.is_owner, bootstrap)
+            (
+                room.name.clone(),
+                Zeroizing::new(persistence::decrypt_room_passphrase(&room.passphrase, &pgp_identity)),
+                room.is_owner,
+                bootstrap,
+            )
         } else {
             // Normal menu flow: interactive room selection then bootstrap prompt.
             let (room_name, pass, is_owner) =
@@ -150,7 +155,7 @@ pub async fn run(
                 passphrase: current_pass.as_str().to_owned(),
                 is_owner:   current_is_owner,
             });
-            let _ = persistence::save_rooms(&storage_dir, &known_rooms);
+            let _ = persistence::save_rooms(&storage_dir, &known_rooms, Some(&pgp_identity));
         }
 
         // ── Build a fresh swarm for this session ───────────────────────────
@@ -540,7 +545,7 @@ pub async fn run(
                                                                     passphrase: pass.as_str().to_owned(),
                                                                     is_owner,
                                                                 });
-                                                                let _ = persistence::save_rooms(&storage_dir, &known_rooms);
+                                                                let _ = persistence::save_rooms(&storage_dir, &known_rooms, Some(&pgp_identity));
                                                             }
                                                             print_system(&format!("Leaving {}...", current_room))?;
                                                             pending_switch = Some((name, pass, is_owner));
@@ -548,11 +553,11 @@ pub async fn run(
                                                         }
                                                         RoomAction::Deleted(name) => {
                                                             print_system(&format!("Room '{}' deleted.", name))?;
-                                                            let _ = persistence::save_rooms(&storage_dir, &known_rooms);
+                                                            let _ = persistence::save_rooms(&storage_dir, &known_rooms, Some(&pgp_identity));
                                                         }
                                                         RoomAction::Left(name) => {
                                                             print_system(&format!("Left room '{}'.", name))?;
-                                                            let _ = persistence::save_rooms(&storage_dir, &known_rooms);
+                                                            let _ = persistence::save_rooms(&storage_dir, &known_rooms, Some(&pgp_identity));
                                                         }
                                                         RoomAction::Cancel => {}
                                                     }
@@ -591,7 +596,7 @@ pub async fn run(
                                                                     passphrase: pass.as_str().to_owned(),
                                                                     is_owner,
                                                                 });
-                                                                let _ = persistence::save_rooms(&storage_dir, &known_rooms);
+                                                                let _ = persistence::save_rooms(&storage_dir, &known_rooms, Some(&pgp_identity));
                                                                 print_system(&format!("Leaving {}...", current_room))?;
                                                                 pending_switch = Some((name, pass, is_owner));
                                                                 let _ = handle.cmd_tx.send(RoomCommand::Disconnect).await;

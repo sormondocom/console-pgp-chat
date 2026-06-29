@@ -23,6 +23,7 @@ use pgp::{
     ser::Serialize,
     types::StringToKey,
 };
+use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 
@@ -33,12 +34,14 @@ pub fn seal(plaintext: &[u8], passphrase: &str) -> Result<Vec<u8>> {
     let mut rng = rand::thread_rng();
     let s2k = StringToKey::new_default(&mut rng);
 
-    let pw = passphrase.to_string();
+    // Zeroizing<String> ensures the local copy of the passphrase is wiped
+    // from the heap when seal() returns, limiting the memory exposure window.
+    let pw = Zeroizing::new(passphrase.to_string());
     let msg = Message::new_literal_bytes("", plaintext);
 
     let encrypted = msg
         .encrypt_with_password(&mut rng, s2k, SymmetricKeyAlgorithm::AES256, || {
-            pw.clone()
+            pw.as_str().to_owned() // rPGP receives a plain String; we can't control its internals
         })
         .map_err(|e| Error::PgpEncryption(e.to_string()))?;
 
@@ -56,13 +59,13 @@ pub fn seal(plaintext: &[u8], passphrase: &str) -> Result<Vec<u8>> {
 /// Returns `Err` if the passphrase is wrong, the packet is corrupt, or the
 /// data is not a password-protected OpenPGP message.
 pub fn open(ciphertext: &[u8], passphrase: &str) -> Result<Vec<u8>> {
-    let pw = passphrase.to_string();
+    let pw = Zeroizing::new(passphrase.to_string());
 
     let msg = Message::from_bytes(Cursor::new(ciphertext))
         .map_err(|e| Error::PgpDecryption(e.to_string()))?;
 
     let decrypted = msg
-        .decrypt_with_password(|| pw)
+        .decrypt_with_password(|| pw.as_str().to_owned())
         .map_err(|_| Error::DecryptionFailed)?;
 
     decrypted

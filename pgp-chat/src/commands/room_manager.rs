@@ -1,7 +1,7 @@
 //! Manage persisted rooms: list, add, view details, rename, update passphrase, forget.
 
 use anyhow::{Context, Result};
-use pgp_chat_core::persistence::{self, PersistedRoom};
+use pgp_chat_core::persistence::{self, PersistedRoom, passphrase_is_encrypted};
 use std::io::{stdout, Write};
 use std::path::Path;
 use crate::ui::Ui;
@@ -12,7 +12,7 @@ use crate::ui::Ui;
 
 pub fn run(ui: &Ui, storage_dir: &Path) -> Result<()> {
     loop {
-        let rooms = persistence::load_rooms(storage_dir);
+        let rooms = persistence::load_rooms(storage_dir, None);
 
         ui.clear()?;
         ui.renderer.draw_box_top("Manage Rooms")?;
@@ -94,9 +94,9 @@ fn create_room(ui: &Ui, storage_dir: &Path, existing: &[PersistedRoom]) -> Resul
     ui.show_passphrase_box("Room Passphrase — share this with your peers", &passphrase);
     println!("  Anyone without this passphrase cannot read room traffic.\r");
 
-    let mut rooms = persistence::load_rooms(storage_dir);
+    let mut rooms = persistence::load_rooms(storage_dir, None);
     rooms.push(PersistedRoom { name: name.clone(), passphrase, is_owner: true });
-    persistence::save_rooms(storage_dir, &rooms)
+    persistence::save_rooms(storage_dir, &rooms, None)
         .with_context(|| "Failed to save rooms")?;
 
     ui.success(&format!("Room '{}' created — you are the owner.", name))?;
@@ -125,13 +125,13 @@ fn join_room(ui: &Ui, storage_dir: &Path, existing: &[PersistedRoom]) -> Result<
         return Ok(());
     }
 
-    let mut rooms = persistence::load_rooms(storage_dir);
+    let mut rooms = persistence::load_rooms(storage_dir, None);
     rooms.push(PersistedRoom {
         name:       name.clone(),
         passphrase: input.as_str().to_owned(),
         is_owner:   false,
     });
-    persistence::save_rooms(storage_dir, &rooms)
+    persistence::save_rooms(storage_dir, &rooms, None)
         .with_context(|| "Failed to save rooms")?;
 
     ui.success(&format!("Room '{}' saved — you are a member.", name))?;
@@ -165,7 +165,7 @@ fn prompt_unique_room_name(ui: &Ui, existing: &[PersistedRoom]) -> Result<String
 
 fn room_detail(ui: &Ui, storage_dir: &Path, idx: usize) -> Result<()> {
     loop {
-        let rooms = persistence::load_rooms(storage_dir);
+        let rooms = persistence::load_rooms(storage_dir, None);
         if idx >= rooms.len() {
             return Ok(());
         }
@@ -175,7 +175,12 @@ fn room_detail(ui: &Ui, storage_dir: &Path, idx: usize) -> Result<()> {
         ui.renderer.draw_box_top("Room Details")?;
         ui.info("Name",       &r.name)?;
         ui.info("Role",       if r.is_owner { "owner" } else { "member" })?;
-        ui.info("Passphrase", &"*".repeat(r.passphrase.len().min(32)))?;
+        let pass_display = if passphrase_is_encrypted(&r.passphrase) {
+            "[encrypted — view in chat]".to_string()
+        } else {
+            "*".repeat(r.passphrase.len().min(32))
+        };
+        ui.info("Passphrase", &pass_display)?;
         ui.renderer.draw_box_separator()?;
         println!("  [s] Show passphrase\r");
         println!("  [n] Rename room\r");
@@ -199,20 +204,27 @@ fn room_detail(ui: &Ui, storage_dir: &Path, idx: usize) -> Result<()> {
 }
 
 fn show_passphrase(ui: &Ui, storage_dir: &Path, idx: usize) -> Result<()> {
-    let rooms = persistence::load_rooms(storage_dir);
+    let rooms = persistence::load_rooms(storage_dir, None);
     if idx >= rooms.len() {
         return Ok(());
     }
     let r = &rooms[idx];
     println!("\r");
-    ui.show_passphrase_box(&format!("Passphrase for '{}'", r.name), &r.passphrase);
-    println!("  Share this out-of-band with peers who need to join the room.\r");
+    if passphrase_is_encrypted(&r.passphrase) {
+        ui.info(
+            "Passphrase",
+            "encrypted — enter a chat session to view or share this room's passphrase",
+        )?;
+    } else {
+        ui.show_passphrase_box(&format!("Passphrase for '{}'", r.name), &r.passphrase);
+        println!("  Share this out-of-band with peers who need to join the room.\r");
+    }
     ui.wait_for_key("Press any key to continue...")?;
     Ok(())
 }
 
 fn rename_room(ui: &Ui, storage_dir: &Path, idx: usize) -> Result<()> {
-    let mut rooms = persistence::load_rooms(storage_dir);
+    let mut rooms = persistence::load_rooms(storage_dir, None);
     if idx >= rooms.len() {
         return Ok(());
     }
@@ -232,7 +244,7 @@ fn rename_room(ui: &Ui, storage_dir: &Path, idx: usize) -> Result<()> {
     }
 
     rooms[idx].name = new_name.clone();
-    persistence::save_rooms(storage_dir, &rooms)
+    persistence::save_rooms(storage_dir, &rooms, None)
         .with_context(|| "Failed to save rooms")?;
     ui.success(&format!("Room renamed from '{}' to '{}'.", old_name, new_name))?;
     ui.wait_for_key("Press any key...")?;
@@ -240,7 +252,7 @@ fn rename_room(ui: &Ui, storage_dir: &Path, idx: usize) -> Result<()> {
 }
 
 fn update_passphrase(ui: &Ui, storage_dir: &Path, idx: usize) -> Result<()> {
-    let mut rooms = persistence::load_rooms(storage_dir);
+    let mut rooms = persistence::load_rooms(storage_dir, None);
     if idx >= rooms.len() {
         return Ok(());
     }
@@ -265,7 +277,7 @@ fn update_passphrase(ui: &Ui, storage_dir: &Path, idx: usize) -> Result<()> {
 
     rooms[idx].passphrase = passphrase;
     rooms[idx].is_owner   = is_owner;
-    persistence::save_rooms(storage_dir, &rooms)
+    persistence::save_rooms(storage_dir, &rooms, None)
         .with_context(|| "Failed to save rooms")?;
     let role = if is_owner { "owner" } else { "member" };
     ui.success(&format!("Passphrase updated for '{}' ({}).", room_name, role))?;
@@ -304,14 +316,26 @@ fn forget_room(ui: &Ui, storage_dir: &Path, rooms: &[PersistedRoom]) -> Result<(
     let room = &rooms[idx];
 
     if room.is_owner {
-        // Owners confirm with passphrase before removing.
         println!("\r");
-        println!("  You are the owner of '{}'.  Confirm with your room passphrase.\r", room.name);
-        let entered = ui.prompt_password("Room passphrase:")?;
-        if entered.as_str() != room.passphrase {
-            ui.error("Incorrect passphrase — cancelled.")?;
-            ui.wait_for_key("Press any key...")?;
-            return Ok(());
+        if passphrase_is_encrypted(&room.passphrase) {
+            // Passphrase is PGP-encrypted — we can't compare without identity.
+            // Use a typed-confirmation instead.
+            println!("  You are the owner of '{}'.\r", room.name);
+            let confirm = ui.prompt("Type 'yes' to confirm removing this room:")?;
+            if !confirm.trim().eq_ignore_ascii_case("yes") {
+                println!("  Cancelled.\r");
+                ui.wait_for_key("Press any key...")?;
+                return Ok(());
+            }
+        } else {
+            // Plaintext passphrase — compare directly as before.
+            println!("  You are the owner of '{}'.  Confirm with your room passphrase.\r", room.name);
+            let entered = ui.prompt_password("Room passphrase:")?;
+            if entered.as_str() != room.passphrase {
+                ui.error("Incorrect passphrase — cancelled.")?;
+                ui.wait_for_key("Press any key...")?;
+                return Ok(());
+            }
         }
     } else {
         let confirm = ui.prompt(&format!(
@@ -325,9 +349,9 @@ fn forget_room(ui: &Ui, storage_dir: &Path, rooms: &[PersistedRoom]) -> Result<(
     }
 
     let room_name = room.name.clone();
-    let mut updated = persistence::load_rooms(storage_dir);
+    let mut updated = persistence::load_rooms(storage_dir, None);
     updated.retain(|r| r.name != room_name);
-    persistence::save_rooms(storage_dir, &updated)
+    persistence::save_rooms(storage_dir, &updated, None)
         .with_context(|| "Failed to save rooms")?;
 
     ui.success(&format!("Room '{}' removed from your list.", room_name))?;
