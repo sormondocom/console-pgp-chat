@@ -101,6 +101,9 @@ pub async fn run(
 
     // ── Load known rooms ───────────────────────────────────────────────────
     let mut known_rooms: Vec<PersistedRoom> = persistence::load_rooms(&storage_dir, Some(&pgp_identity));
+    // Re-save immediately so any rooms created before an identity was loaded
+    // (e.g. from room_manager when no identity was entered) get encrypted now.
+    let _ = persistence::save_rooms(&storage_dir, &known_rooms, Some(&pgp_identity));
 
     // ── One-time network config ────────────────────────────────────────────
     let port_str = ui.prompt("Listen port [0 = random]:")?;

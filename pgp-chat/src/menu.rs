@@ -60,7 +60,7 @@ pub async fn run() -> Result<()> {
                 commands::identity_manager::run(&ui, &storage_dir, &mut config)
             }
             MenuItem::ManageRooms => {
-                commands::room_manager::run(&ui, &storage_dir)
+                commands::room_manager::run(&ui, &storage_dir, &config)
             }
             MenuItem::ScanPeers => {
                 commands::peer_scanner::run(&ui, &storage_dir, &config).await
