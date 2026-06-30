@@ -15,6 +15,20 @@ use pgp_chat_core::{
 use std::io::{self, stdout, Write};
 
 // ---------------------------------------------------------------------------
+// Display sanitization
+// ---------------------------------------------------------------------------
+
+/// Strip control characters from a peer-supplied string before printing to the
+/// terminal. Bytes below 0x20 (except tab) and DEL (0x7F) can carry ANSI/VT100
+/// escape sequences that manipulate terminal state, inject fake UI content, or
+/// on some terminals read/write the system clipboard via OSC 52.
+pub fn sanitize_display(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() && c != '\t' { '?' } else { c })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Ui
 // ---------------------------------------------------------------------------
 
@@ -25,8 +39,17 @@ pub struct Ui {
 
 impl Ui {
     /// Build a `Ui` with chat colors driven by the active theme in `config`.
+    #[allow(dead_code)]
     pub fn from_config(config: &AppConfig) -> Self {
         let cap = TerminalCapability::detect();
+        Self { renderer: Renderer::with_theme(cap, &config.chat_theme) }
+    }
+
+    /// Like `from_config` but overrides the detected terminal width.
+    /// Used to reserve the right columns for the sidebar.
+    pub fn from_config_at_width(config: &AppConfig, width: u16) -> Self {
+        let mut cap = TerminalCapability::detect();
+        cap.width = width;
         Self { renderer: Renderer::with_theme(cap, &config.chat_theme) }
     }
 

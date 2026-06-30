@@ -122,6 +122,24 @@ pub enum RoomCommand {
 
     /// Decline an inbound file offer.
     DeclineFile { transfer_id: uuid::Uuid },
+
+    /// Cast this node's vote on a pending unanimous admission request.
+    CastVote {
+        candidate_fp: String,
+        /// `true` = admit, `false` = veto.
+        approved:     bool,
+    },
+}
+
+/// Tracks the in-progress unanimous admission vote for one candidate.
+struct ApprovalState {
+    nickname:        String,
+    peer_id:         PeerId,
+    armored_key:     String,
+    /// Fingerprints of all peers whose vote is required (includes this node).
+    required_voters: HashSet<String>,
+    /// Votes collected so far: voter_fp → approved.
+    votes:           HashMap<String, bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +177,10 @@ pub struct ChatRoom {
     cmd_rx:           mpsc::Receiver<RoomCommand>,
     /// Rolling window of recently-seen message IDs for replay deduplication.
     seen_messages:    VecDeque<Uuid>,
+
+    // ── Join admission state ───────────────────────────────────────────────
+    /// In-flight unanimous join votes: candidate_fp → ApprovalState.
+    pending_approvals: HashMap<String, ApprovalState>,
 
     // ── File transfer state ────────────────────────────────────────────────
     /// Outbound offers awaiting acceptance: transfer_id → PendingOffer.
@@ -200,6 +222,7 @@ impl ChatRoom {
             event_tx,
             cmd_rx,
             seen_messages: VecDeque::with_capacity(SEEN_MSG_CAPACITY),
+            pending_approvals: HashMap::new(),
             pending_offers: HashMap::new(),
             inbound_transfers: HashMap::new(),
             accepted_saves: HashMap::new(),
@@ -454,6 +477,27 @@ impl ChatRoom {
                 }
             }
 
+            RoomCommand::CastVote { candidate_fp, approved } => {
+                let my_fp = self.identity.fingerprint();
+                if let Some(state) = self.pending_approvals.get_mut(&candidate_fp) {
+                    state.votes.insert(my_fp, approved);
+                } else {
+                    warn!(%candidate_fp, "CastVote: no pending approval for fingerprint");
+                    return;
+                }
+                let msg = ChatMessage::new_join_vote(
+                    &self.topic.hash().to_string(),
+                    &self.identity.fingerprint(),
+                    self.identity.nickname(),
+                    candidate_fp.clone(),
+                    approved,
+                );
+                if let Err(e) = self.publish_message(msg).await {
+                    warn!("JoinVote broadcast failed: {e}");
+                }
+                self.check_and_resolve_join(&candidate_fp).await;
+            }
+
         }
     }
 
@@ -479,13 +523,13 @@ impl ChatRoom {
 
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 info!(%peer_id, "connection closed");
-                // Mark peer offline in node map
-                if let Some(info) = self.node_map.values_mut()
-                    .find(|n| n.fingerprint == self.keystore
-                        .fingerprint_for_peer(&peer_id)
-                        .unwrap_or(""))
-                {
-                    info.status = NodeStatus::Offline;
+                let offline_fp = self.keystore.fingerprint_for_peer(&peer_id)
+                    .map(|s| s.to_string());
+                if let Some(ref fp) = offline_fp {
+                    if let Some(info) = self.node_map.get_mut(fp.as_str()) {
+                        info.status = NodeStatus::Offline;
+                    }
+                    self.apply_offline_veto(fp).await;
                 }
                 let _ = self.event_tx.send(ChatNetEvent::ConnectionClosed(peer_id)).await;
             }
@@ -600,7 +644,12 @@ impl ChatRoom {
                     // Status updates are accepted only from verified senders.
                     // An unverified peer cannot manipulate another peer's online/offline status.
                     MessageKind::StatusAnnounce { status } if verified => {
-                        self.handle_status_announce(sender_fp, &signed.message.sender_nick, status.clone());
+                        let is_offline = matches!(status, NodeStatus::Offline);
+                        let fp_owned   = sender_fp.to_string();
+                        self.handle_status_announce(&fp_owned, &signed.message.sender_nick, status.clone());
+                        if is_offline {
+                            self.apply_offline_veto(&fp_owned).await;
+                        }
                     }
 
                     MessageKind::Revoke { fingerprint } if verified => {
@@ -637,6 +686,13 @@ impl ChatRoom {
 
                     MessageKind::FileComplete(complete) if verified => {
                         self.handle_file_complete(complete.clone()).await;
+                    }
+
+                    MessageKind::JoinVote { candidate_fingerprint, approved } if verified => {
+                        let voter_fp = sender_fp.to_string();
+                        let cand_fp  = candidate_fingerprint.to_string();
+                        let voted    = *approved;
+                        self.handle_join_vote(&voter_fp, &cand_fp, voted).await;
                     }
 
                     _ => {}
@@ -781,15 +837,49 @@ impl ChatRoom {
                 "Key from {nickname} ({actual_fp}) deferred — approve with 'a' or 'y'"
             ))).await;
         } else {
-            self.keystore.insert_pending(
-                peer_id, actual_fp.clone(), key, nickname.to_string(),
-            );
-            self.node_map_upsert(&actual_fp, nickname, TrustState::Pending, NodeStatus::Online);
-            let _ = self.event_tx.send(ChatNetEvent::KeyApprovalRequired {
-                peer_id,
-                fingerprint: actual_fp,
-                nickname: nickname.to_string(),
-            }).await;
+            let my_fp = self.identity.fingerprint();
+            // Count trusted+online peers (excluding the candidate) to decide
+            // whether unanimous admission control is required.
+            let trusted_online: HashSet<String> = self.node_map.values()
+                .filter(|n| {
+                    n.trust  == TrustState::Trusted
+                        && n.status == NodeStatus::Online
+                        && n.fingerprint != actual_fp
+                })
+                .map(|n| n.fingerprint.clone())
+                .collect();
+
+            if trusted_online.is_empty() {
+                // No trusted peers online — use the single-approver path.
+                self.keystore.insert_pending(
+                    peer_id, actual_fp.clone(), key, nickname.to_string(),
+                );
+                self.node_map_upsert(&actual_fp, nickname, TrustState::Pending, NodeStatus::Online);
+                let _ = self.event_tx.send(ChatNetEvent::KeyApprovalRequired {
+                    peer_id,
+                    fingerprint: actual_fp,
+                    nickname: nickname.to_string(),
+                }).await;
+            } else {
+                // Unanimous admission: all trusted online peers (including us) must vote YES.
+                let mut required_voters = trusted_online;
+                required_voters.insert(my_fp);
+                let voter_count = required_voters.len();
+
+                self.pending_approvals.insert(actual_fp.clone(), ApprovalState {
+                    nickname:        nickname.to_string(),
+                    peer_id,
+                    armored_key:     armored.to_string(),
+                    required_voters,
+                    votes:           HashMap::new(),
+                });
+                self.node_map_upsert(&actual_fp, nickname, TrustState::Pending, NodeStatus::Online);
+                let _ = self.event_tx.send(ChatNetEvent::JoinApprovalRequired {
+                    fingerprint: actual_fp,
+                    nickname:    nickname.to_string(),
+                    voter_count,
+                }).await;
+            }
         }
     }
 
@@ -829,6 +919,92 @@ impl ChatRoom {
             fingerprint: fingerprint.to_string(),
             nickname: nickname.to_string(),
         }).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Unanimous join admission
+    // -----------------------------------------------------------------------
+
+    async fn handle_join_vote(&mut self, voter_fp: &str, candidate_fp: &str, approved: bool) {
+        if let Some(state) = self.pending_approvals.get_mut(candidate_fp) {
+            if state.required_voters.contains(voter_fp) {
+                state.votes.insert(voter_fp.to_string(), approved);
+            }
+        }
+        self.check_and_resolve_join(candidate_fp).await;
+    }
+
+    async fn check_and_resolve_join(&mut self, candidate_fp: &str) {
+        let resolution = {
+            let state = match self.pending_approvals.get(candidate_fp) {
+                Some(s) => s,
+                None    => return,
+            };
+            let all_voted = state.required_voters.iter().all(|fp| state.votes.contains_key(fp));
+            if !all_voted { return; }
+            let veto_fp = state.votes.iter()
+                .find(|(_, &v)| !v)
+                .map(|(fp, _)| fp.clone());
+            (state.nickname.clone(), state.peer_id, state.armored_key.clone(), veto_fp)
+        };
+
+        let (nickname, peer_id, armored_key, veto_fp) = resolution;
+        let candidate_fp = candidate_fp.to_string();
+        self.pending_approvals.remove(&candidate_fp);
+
+        let approved      = veto_fp.is_none();
+        let vetoed_by_nick = veto_fp.as_deref()
+            .and_then(|fp| self.node_map.get(fp))
+            .map(|n| n.nickname.clone());
+
+        if approved {
+            use pgp::composed::{Deserializable, SignedPublicKey};
+            use std::io::Cursor;
+            match SignedPublicKey::from_armor_single(Cursor::new(armored_key.as_bytes())) {
+                Ok((key, _)) => {
+                    self.keystore.insert_pending(
+                        peer_id, candidate_fp.clone(), key, nickname.clone(),
+                    );
+                    self.keystore.approve(&candidate_fp);
+                    self.node_map_upsert(
+                        &candidate_fp, &nickname, TrustState::Trusted, NodeStatus::Online,
+                    );
+                    let _ = self.publish_announce_key().await;
+                    info!(%candidate_fp, %nickname, "unanimous admission granted");
+                }
+                Err(e) => {
+                    warn!(%candidate_fp, "re-parse of admitted peer key failed: {e}");
+                }
+            }
+        } else {
+            self.node_map_set_trust(&candidate_fp, TrustState::Rejected);
+            info!(%candidate_fp, %nickname, "unanimous admission vetoed");
+        }
+
+        let _ = self.event_tx.send(ChatNetEvent::JoinDecided {
+            fingerprint:    candidate_fp,
+            nickname,
+            approved,
+            vetoed_by_nick,
+        }).await;
+    }
+
+    async fn apply_offline_veto(&mut self, offline_fp: &str) {
+        let candidates: Vec<String> = self.pending_approvals.keys().cloned().collect();
+        for candidate_fp in candidates {
+            let needs_veto = self.pending_approvals.get(&candidate_fp)
+                .map(|s| {
+                    s.required_voters.contains(offline_fp)
+                        && !s.votes.contains_key(offline_fp)
+                })
+                .unwrap_or(false);
+            if needs_veto {
+                if let Some(state) = self.pending_approvals.get_mut(&candidate_fp) {
+                    state.votes.insert(offline_fp.to_string(), false);
+                }
+            }
+            self.check_and_resolve_join(&candidate_fp).await;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1189,10 +1365,18 @@ impl ChatRoom {
 
         let total_chunks = (offer.size_bytes as usize).div_ceil(CHUNK_BYTES) as u32;
 
+        // Strip path separators from the remote-supplied filename so a peer cannot
+        // write outside the receiver's chosen save directory via "../" traversal.
+        let safe_filename = std::path::Path::new(&offer.filename)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
         // Emit event to UI for consent
         let _ = self.event_tx.send(ChatNetEvent::InboundFileOffer {
             transfer_id:  tid,
-            filename:     offer.filename.clone(),
+            filename:     safe_filename,
             size_bytes:   offer.size_bytes,
             description:  offer.description.clone(),
             sender_fp:    offer.sender_info.fingerprint.clone(),

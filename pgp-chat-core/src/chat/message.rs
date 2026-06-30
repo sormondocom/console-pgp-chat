@@ -115,6 +115,18 @@ pub enum MessageKind {
 
     /// Sender signals all chunks have been sent; includes SHA-256 of plaintext.
     FileComplete(FileComplete),
+
+    /// A trusted room member's vote on whether a new peer should be admitted.
+    ///
+    /// All currently-trusted online peers must cast `approved: true` before the
+    /// candidate is granted access.  A single `false` (or a required voter going
+    /// offline mid-vote) is an immediate unanimous-veto rejection.
+    JoinVote {
+        /// PGP fingerprint of the candidate seeking admission.
+        candidate_fingerprint: String,
+        /// `true` = admit, `false` = veto.
+        approved: bool,
+    },
 }
 
 /// A [`ChatMessage`] together with a detached PGP signature.
@@ -302,6 +314,23 @@ impl ChatMessage {
             sender_nick: sender_nick.to_string(),
             timestamp:   Utc::now(),
             kind:        MessageKind::FileComplete(complete),
+        }
+    }
+
+    pub fn new_join_vote(
+        room: &str,
+        sender_fp: &str,
+        sender_nick: &str,
+        candidate_fingerprint: String,
+        approved: bool,
+    ) -> Self {
+        Self {
+            id:          Uuid::new_v4(),
+            room:        room.to_string(),
+            sender_fp:   sender_fp.to_string(),
+            sender_nick: sender_nick.to_string(),
+            timestamp:   Utc::now(),
+            kind:        MessageKind::JoinVote { candidate_fingerprint, approved },
         }
     }
 }

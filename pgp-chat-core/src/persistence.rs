@@ -337,6 +337,42 @@ pub fn save_rooms(
 }
 
 // ---------------------------------------------------------------------------
+// Trust request persistence
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingTrustRequest {
+    pub from_nickname:           String,
+    pub from_fingerprint:        String,
+    pub from_public_key_armored: String,
+    pub received_at:             DateTime<Utc>,
+}
+
+pub fn trust_requests_path(dir: &Path) -> PathBuf { dir.join("trust_requests.json") }
+
+pub fn load_pending_trust_requests(dir: &Path) -> Vec<PendingTrustRequest> {
+    let path = trust_requests_path(dir);
+    if !path.exists() {
+        return Vec::new();
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_pending_trust_requests(dir: &Path, requests: &[PendingTrustRequest]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let json = serde_json::to_string_pretty(requests)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let path = trust_requests_path(dir);
+    let tmp  = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Chat theme
 // ---------------------------------------------------------------------------
 

@@ -23,6 +23,8 @@
 //! | /send                | Send a file to a peer (prompts interactively)   |
 //! | /accept [path]       | Accept an incoming file offer                   |
 //! | /decline             | Decline an incoming file offer                  |
+//! | /admit [fp]          | Vote YES on a pending room join request         |
+//! | /veto [fp]           | Vote NO on a pending room join request          |
 //! | /nuke                | Wipe identity and broadcast revocation          |
 //! | Ctrl-C / Ctrl-D      | Quit                                            |
 
@@ -214,6 +216,7 @@ pub async fn run(
         let mut peer_index     = 0usize;
         let mut is_deferring   = false;
         let mut last_pending: Option<(String, String)> = None;
+        let mut last_admission: Option<(String, String)> = None; // (fp, nickname) for /admit /veto
         let mut last_offer: Option<(uuid::Uuid, String)> = None; // (transfer_id, filename)
         let mut event_stream   = EventStream::new();
         let mut trust_snapshot: Option<PersistedTrustStore> = None;
@@ -275,10 +278,11 @@ pub async fn run(
                                 } else {
                                     String::new()
                                 };
+                                let safe_nick = crate::ui::sanitize_display(&m.sender_nick);
                                 let display_nick = if verified {
-                                    format!("{}{}", m.sender_nick, fp_suffix)
+                                    format!("{}{}", safe_nick, fp_suffix)
                                 } else {
-                                    format!("[?] {}{}", m.sender_nick, fp_suffix)
+                                    format!("[?] {}{}", safe_nick, fp_suffix)
                                 };
 
                                 match &m.kind {
@@ -324,17 +328,44 @@ pub async fn run(
                                     | MessageKind::FileAccept(_)
                                     | MessageKind::FileDecline(_)
                                     | MessageKind::FileChunk(_)
-                                    | MessageKind::FileComplete(_) => {}
+                                    | MessageKind::FileComplete(_)
+                                    | MessageKind::JoinVote { .. } => {}
                                 }
                             }
                         }
 
                         Some(ChatNetEvent::KeyApprovalRequired { fingerprint, nickname, .. }) => {
+                            let safe_nick = crate::ui::sanitize_display(&nickname);
                             print_system(&format!(
                                 "[?] New key from {} ({}) — /trust to approve, /deny to reject, /trustall for all",
-                                nickname, fingerprint
+                                safe_nick, fingerprint
                             ))?;
-                            last_pending = Some((fingerprint, nickname));
+                            last_pending = Some((fingerprint, safe_nick));
+                        }
+
+                        Some(ChatNetEvent::JoinApprovalRequired { fingerprint, nickname, voter_count }) => {
+                            let safe_nick = crate::ui::sanitize_display(&nickname);
+                            print_system(&format!(
+                                "[?] {} ({}) wants to join — {} member(s) must unanimously agree.",
+                                safe_nick, &fingerprint[..fingerprint.len().min(16)], voter_count
+                            ))?;
+                            print_system("    Type /admit to approve or /veto to block.")?;
+                            last_admission = Some((fingerprint, safe_nick));
+                        }
+
+                        Some(ChatNetEvent::JoinDecided { nickname, approved, vetoed_by_nick, .. }) => {
+                            let safe_nick = crate::ui::sanitize_display(&nickname);
+                            if approved {
+                                print_system(&format!("[+] {} has been admitted to the room.", safe_nick))?;
+                            } else {
+                                let by = vetoed_by_nick
+                                    .map(|n| format!(" (vetoed by {})", crate::ui::sanitize_display(&n)))
+                                    .unwrap_or_default();
+                                print_system(&format!("[-] {} was denied entry{}.", safe_nick, by))?;
+                            }
+                            if last_admission.as_ref().map(|(_, n)| n == &safe_nick).unwrap_or(false) {
+                                last_admission = None;
+                            }
                         }
 
                         Some(ChatNetEvent::DeferredKeysAvailable(n)) => {
@@ -355,7 +386,8 @@ pub async fn run(
                                 let fp_short = &node.fingerprint[..16.min(node.fingerprint.len())];
                                 print_system(&format!(
                                     "  {:>9}  {:>10}  {}  {}",
-                                    trust_s, status_s, fp_short, node.nickname,
+                                    trust_s, status_s, fp_short,
+                                    crate::ui::sanitize_display(&node.nickname),
                                 ))?;
                             }
                             print_system("──────────────────────────────────────────────")?;
@@ -365,19 +397,22 @@ pub async fn run(
                             transfer_id, filename, size_bytes, description,
                             sender_fp, sender_nick, sender_addrs,
                         }) => {
+                            let safe_nick = crate::ui::sanitize_display(&sender_nick);
+                            let safe_filename = crate::ui::sanitize_display(&filename);
+                            let safe_desc = crate::ui::sanitize_display(&description);
                             print_system("── Incoming File Transfer ─────────────────────")?;
-                            print_system(&format!("  From:        {} ({})", sender_nick, sender_fp))?;
-                            print_system(&format!("  File:        {}", filename))?;
+                            print_system(&format!("  From:        {} ({})", safe_nick, sender_fp))?;
+                            print_system(&format!("  File:        {}", safe_filename))?;
                             print_system(&format!("  Size:        {} bytes", size_bytes))?;
                             if !description.is_empty() {
-                                print_system(&format!("  Description: {}", description))?;
+                                print_system(&format!("  Description: {}", safe_desc))?;
                             }
                             if !sender_addrs.is_empty() {
                                 print_system(&format!("  Network:     {}", sender_addrs.join(", ")))?;
                             }
                             print_system("  Type /accept to accept (prompts for save path), /decline to reject.")?;
                             print_system("──────────────────────────────────────────────")?;
-                            last_offer = Some((transfer_id, filename));
+                            last_offer = Some((transfer_id, safe_filename));
                         }
 
                         Some(ChatNetEvent::FileReceived { transfer_id: _, filename, save_path }) => {
@@ -434,6 +469,19 @@ pub async fn run(
                 // ── Keyboard input ─────────────────────────────────────────
                 term_evt = event_stream.next() => {
                     match term_evt {
+                        // On resize, clear stale layout and reprint the room banner
+                        // so content doesn't overlap across the old and new widths.
+                        Some(Ok(Event::Resize(new_w, _))) => {
+                            let main_w = crate::sidebar::main_width(new_w);
+                            ui.renderer.set_width(main_w);
+                            execute!(stdout(), crossterm::terminal::Clear(crossterm::terminal::ClearType::All), cursor::MoveTo(0, 0))?;
+                            let role_tag = if current_is_owner { "owner" } else { "member" };
+                            ui.renderer.draw_box_separator()?;
+                            println!("  Room: {}  [{}]  — type /help for commands\r", current_room, role_tag);
+                            ui.renderer.draw_box_separator()?;
+                            stdout().flush()?;
+                        }
+
                         Some(Ok(Event::Key(KeyEvent {
                             code, modifiers, kind: KeyEventKind::Press, ..
                         }))) => {
@@ -522,6 +570,8 @@ pub async fn run(
                                                 print_system("  /deny [fp]       — deny last pending key, or a specific fingerprint")?;
                                                 print_system("  /trustall        — approve all pending keys at once")?;
                                                 print_system("  /defer           — toggle key deferral mode on/off")?;
+                                                print_system("  /admit [fp]      — vote YES on pending room join request")?;
+                                                print_system("  /veto [fp]       — vote NO on pending room join request")?;
                                                 print_system("  /send            — send a file to a peer (prompts interactively)")?;
                                                 print_system("  /accept [path]   — accept an incoming file offer")?;
                                                 print_system("  /decline         — decline an incoming file offer")?;
@@ -620,7 +670,7 @@ pub async fn run(
                                                     }
                                                     None => {
                                                         if let Some((fp, nick)) = last_pending.take() {
-                                                            print_system(&format!("Approving key from {}...", nick))?;
+                                                            print_system(&format!("Approving key from {} [{}]...", nick, fp))?;
                                                             let _ = handle.cmd_tx.send(RoomCommand::ApproveKey(fp)).await;
                                                         } else {
                                                             print_system("No pending key to approve.")?;
@@ -640,7 +690,7 @@ pub async fn run(
                                                     }
                                                     None => {
                                                         if let Some((fp, nick)) = last_pending.take() {
-                                                            print_system(&format!("Denying key from {}.", nick))?;
+                                                            print_system(&format!("Denying key from {} [{}].", nick, fp))?;
                                                             let _ = handle.cmd_tx.send(RoomCommand::DenyKey(fp)).await;
                                                         } else {
                                                             print_system("No pending key to deny.")?;
@@ -662,6 +712,52 @@ pub async fn run(
                                                     if is_deferring { "ON — new keys will be queued" } else { "OFF" }
                                                 ))?;
                                                 let _ = handle.cmd_tx.send(RoomCommand::SetDeferring(is_deferring)).await;
+                                            }
+
+                                            "admit" => {
+                                                let fp_arg = parts.get(1).map(|s| s.trim()).filter(|s| !s.is_empty());
+                                                match fp_arg {
+                                                    Some(fp) => {
+                                                        let _ = handle.cmd_tx.send(RoomCommand::CastVote {
+                                                            candidate_fp: fp.to_string(),
+                                                            approved: true,
+                                                        }).await;
+                                                    }
+                                                    None => {
+                                                        if let Some((fp, nick)) = last_admission.take() {
+                                                            print_system(&format!("Voting to admit {}...", nick))?;
+                                                            let _ = handle.cmd_tx.send(RoomCommand::CastVote {
+                                                                candidate_fp: fp,
+                                                                approved: true,
+                                                            }).await;
+                                                        } else {
+                                                            print_system("No pending join request to admit.")?;
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            "veto" => {
+                                                let fp_arg = parts.get(1).map(|s| s.trim()).filter(|s| !s.is_empty());
+                                                match fp_arg {
+                                                    Some(fp) => {
+                                                        let _ = handle.cmd_tx.send(RoomCommand::CastVote {
+                                                            candidate_fp: fp.to_string(),
+                                                            approved: false,
+                                                        }).await;
+                                                    }
+                                                    None => {
+                                                        if let Some((fp, nick)) = last_admission.take() {
+                                                            print_system(&format!("Vetoing {}'s entry...", nick))?;
+                                                            let _ = handle.cmd_tx.send(RoomCommand::CastVote {
+                                                                candidate_fp: fp,
+                                                                approved: false,
+                                                            }).await;
+                                                        } else {
+                                                            print_system("No pending join request to veto.")?;
+                                                        }
+                                                    }
+                                                }
                                             }
 
                                             "send" => {

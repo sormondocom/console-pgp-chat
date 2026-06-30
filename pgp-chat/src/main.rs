@@ -3,8 +3,10 @@
 //! Entry point: detects terminal capabilities, enables raw mode, runs the
 //! interactive menu, then restores the terminal on exit (even on panic).
 
+mod background;
 mod commands;
 mod menu;
+mod sidebar;
 mod ui;
 
 use anyhow::Result;

@@ -54,6 +54,7 @@ pub fn run(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<()> {
         println!("  [0] Back\r");
         ui.renderer.draw_box_bottom()?;
         stdout().flush()?;
+        crate::sidebar::draw_auto(storage_dir, ui);
 
         let choice = ui.prompt("Choice:")?;
         let choice = choice.trim().to_lowercase();

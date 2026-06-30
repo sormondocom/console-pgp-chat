@@ -23,6 +23,7 @@ pub mod behaviour;
 pub mod event;
 pub mod peer_discovery;
 pub mod transport;
+pub mod trust_message;
 
 pub use behaviour::ChatBehaviour;
 pub use event::ChatNetEvent;

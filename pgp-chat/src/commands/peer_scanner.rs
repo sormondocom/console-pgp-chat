@@ -33,7 +33,11 @@ use libp2p::{
     SwarmBuilder,
 };
 
-use pgp_chat_core::persistence::{self, AppConfig, PersistedRoom};
+use pgp_chat_core::{
+    crypto::identity::PgpIdentity,
+    network::trust_message::{TRUST_TOPIC, TrustRequestMessage},
+    persistence::{self, AppConfig, PendingTrustRequest, PersistedRoom, save_pending_trust_requests},
+};
 use crate::ui::Ui;
 
 const IDENTIFY_PROTOCOL: &str = "/pgp-chat/1.0.0";
@@ -102,9 +106,11 @@ fn build_scanner_swarm(keypair: Keypair) -> Result<libp2p::Swarm<ScannerBehaviou
         .build()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let gossipsub = gossipsub::Behaviour::new(
+    let mut gossipsub = gossipsub::Behaviour::new(
         gossipsub::MessageAuthenticity::Signed(keypair.clone()), gs_cfg,
     ).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    gossipsub.subscribe(&IdentTopic::new(TRUST_TOPIC))?;
 
     let identify = identify::Behaviour::new(
         identify::Config::new(IDENTIFY_PROTOCOL.to_string(), public_key)
@@ -267,7 +273,7 @@ fn draw_footer(ui: &Ui, term_h: u16, scanning: bool, spin: char) -> Result<()> {
         cursor::MoveTo(0, hint_row(term_h)),
         terminal::Clear(terminal::ClearType::CurrentLine),
         SetForegroundColor(pal.dim),
-        Print("  \u{2191}\u{2193} navigate   Enter view rooms"),
+        Print("  \u{2191}\u{2193} navigate   Enter view rooms   [T] trust req"),
     )?;
     if scanning {
         execute!(stdout(), Print("   [S] stop scanning"))?;
@@ -376,10 +382,11 @@ async fn run_scanner(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     let mut si: usize = 0;
 
-    let (_, mut term_h) = terminal::size().unwrap_or((80, 24));
+    let (mut term_w, mut term_h) = terminal::size().unwrap_or((80, 24));
 
     let empty: Vec<(&PeerId, &PeerInfo)> = vec![];
     draw_all(ui, &empty, selected_idx, scroll, scanning, SPIN[si], term_h, &room_by_hash)?;
+    crate::sidebar::draw_auto(storage_dir, ui);
 
     loop {
         tokio::select! {
@@ -390,10 +397,10 @@ async fn run_scanner(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<
                 let Some(Ok(ev)) = kb else { continue; };
 
                 // Handle terminal resize
-                if let Event::Resize(_, h) = ev {
+                if let Event::Resize(w, h) = ev {
+                    term_w = w;
                     term_h = h;
                     let list = pgp_peers(&peer_order, &peers);
-                    // Clamp selection after resize
                     if !list.is_empty() {
                         selected_idx = selected_idx.min(list.len() - 1);
                         let max = max_visible(term_h);
@@ -402,6 +409,7 @@ async fn run_scanner(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<
                         }
                     }
                     draw_all(ui, &list, selected_idx, scroll, scanning, SPIN[si], term_h, &room_by_hash)?;
+                    crate::sidebar::draw(storage_dir, term_w, ui.renderer.cap().unicode)?;
                     continue;
                 }
 
@@ -503,6 +511,53 @@ async fn run_scanner(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<
                         }
                     }
 
+                    // ── Send trust request ────────────────────────────────
+                    KeyCode::Char('t') | KeyCode::Char('T') => {
+                        if let Some(sw) = swarm.as_mut() {
+                            let _ = execute!(stdout(), cursor::Show);
+                            execute!(stdout(),
+                                cursor::MoveTo(0, spin_row(term_h) + 1),
+                            )?;
+                            if let Some(identity) = load_identity_for_trust(ui, config) {
+                                match TrustRequestMessage::new(&identity) {
+                                    Ok(msg) => {
+                                        let topic = IdentTopic::new(TRUST_TOPIC);
+                                        match sw.behaviour_mut().gossipsub.publish(topic, msg.to_bytes()) {
+                                            Ok(_) => {
+                                                execute!(stdout(),
+                                                    cursor::MoveTo(0, spin_row(term_h) + 1),
+                                                    terminal::Clear(terminal::ClearType::CurrentLine),
+                                                    SetForegroundColor(crossterm::style::Color::Green),
+                                                    Print("  Trust request broadcast."),
+                                                    ResetColor,
+                                                )?;
+                                            }
+                                            Err(e) => {
+                                                execute!(stdout(),
+                                                    cursor::MoveTo(0, spin_row(term_h) + 1),
+                                                    terminal::Clear(terminal::ClearType::CurrentLine),
+                                                    Print(format!("  ! Publish error: {e}")),
+                                                )?;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        execute!(stdout(),
+                                            cursor::MoveTo(0, spin_row(term_h) + 1),
+                                            terminal::Clear(terminal::ClearType::CurrentLine),
+                                            Print(format!("  ! Error building trust message: {e}")),
+                                        )?;
+                                    }
+                                }
+                                stdout().flush()?;
+                            }
+                            let _ = execute!(stdout(), cursor::Hide);
+                            let list = pgp_peers(&peer_order, &peers);
+                            draw_all(ui, &list, selected_idx, scroll, scanning, SPIN[si], term_h, &room_by_hash)?;
+                            crate::sidebar::draw(storage_dir, term_w, ui.renderer.cap().unicode)?;
+                        }
+                    }
+
                     _ => {}
                 }
             }
@@ -584,6 +639,33 @@ async fn run_scanner(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<
                         }
                     }
                     SwarmEvent::Behaviour(ScannerBehaviourEvent::Gossipsub(
+                        gossipsub::Event::Message { message, .. }
+                    )) => {
+                        let trust_hash = IdentTopic::new(TRUST_TOPIC).hash();
+                        if message.topic == trust_hash {
+                            if let Some(msg) = TrustRequestMessage::from_bytes(&message.data) {
+                                // Verify freshness, key/fp consistency, and PGP signature.
+                                if msg.verify().is_err() {
+                                    // Silently drop invalid trust requests.
+                                } else {
+                                let mut reqs = persistence::load_pending_trust_requests(storage_dir);
+                                let already = reqs.iter().any(|r| r.from_fingerprint == msg.from_fingerprint);
+                                if !already {
+                                    reqs.push(PendingTrustRequest {
+                                        from_nickname:           msg.from_nickname,
+                                        from_fingerprint:        msg.from_fingerprint,
+                                        from_public_key_armored: msg.from_public_key_armored,
+                                        received_at:             chrono::Utc::now(),
+                                    });
+                                    let _ = save_pending_trust_requests(storage_dir, &reqs);
+                                    // New request arrived — refresh sidebar immediately.
+                                    crate::sidebar::draw(storage_dir, term_w, ui.renderer.cap().unicode)?;
+                                }
+                                } // end else (verify passed)
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(ScannerBehaviourEvent::Gossipsub(
                         gossipsub::Event::Subscribed { peer_id, topic }
                     )) => {
                         if !peers.contains_key(&peer_id) {
@@ -632,6 +714,7 @@ async fn run_scanner(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<
                     si = (si + 1) % SPIN.len();
                     update_spinner(ui, term_h, SPIN[si])?;
                 }
+                crate::sidebar::draw(storage_dir, term_w, ui.renderer.cap().unicode)?;
             }
         }
     }
@@ -766,4 +849,32 @@ async fn join_unknown_room(
     if let Some(ref addr) = bootstrap { println!("  Bootstrap: {}\r", addr); }
     println!("\r");
     super::chat::run(ui, storage_dir, config, Some((room, bootstrap))).await
+}
+
+// ---------------------------------------------------------------------------
+// Load identity for sending a trust request
+// ---------------------------------------------------------------------------
+
+fn load_identity_for_trust(ui: &Ui, config: &AppConfig) -> Option<PgpIdentity> {
+    let name    = config.active_identity.as_ref()?;
+    let entries = persistence::load_identity_entries(&config.identities_dir);
+    let entry   = entries.into_iter().find(|e| &e.name == name)?;
+    let armored = persistence::load_named_identity(&config.identities_dir, &entry.name)
+        .ok()??;
+
+    println!("\r\n  PGP key passphrase required to sign trust request.\r");
+    let passphrase = ui.prompt_password(&format!(
+        "Key passphrase for '{}' [Enter to cancel]:", entry.nickname
+    )).ok()?;
+    if passphrase.is_empty() {
+        return None;
+    }
+
+    match PgpIdentity::from_armored_secret_key(&entry.nickname, &armored, passphrase) {
+        Ok(id) => Some(id),
+        Err(_) => {
+            let _ = ui.error("Incorrect PGP passphrase.");
+            None
+        }
+    }
 }

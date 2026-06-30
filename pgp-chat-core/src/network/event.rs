@@ -103,4 +103,23 @@ pub enum ChatNetEvent {
 
     /// A file transfer failed (download or upload side).
     FileTransferError { transfer_id: uuid::Uuid, reason: String },
+
+    /// A new peer announced their key while trusted peers are online; all
+    /// currently-online trusted members must vote before the peer is admitted.
+    JoinApprovalRequired {
+        fingerprint: String,
+        nickname:    String,
+        /// How many members (including this node) must cast a YES vote.
+        voter_count: usize,
+    },
+
+    /// The unanimous admission vote concluded.
+    JoinDecided {
+        fingerprint:    String,
+        nickname:       String,
+        /// `true` = admitted, `false` = vetoed.
+        approved:       bool,
+        /// Nickname of the peer whose NO vote (or offline departure) ended the vote.
+        vetoed_by_nick: Option<String>,
+    },
 }

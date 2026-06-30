@@ -42,6 +42,7 @@ pub fn run(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<()> {
         println!("  [0] Back\r");
         ui.renderer.draw_box_bottom()?;
         stdout().flush()?;
+        crate::sidebar::draw_auto(storage_dir, ui);
 
         let choice = ui.prompt("Choice:")?;
         let choice = choice.trim().to_lowercase();
@@ -195,6 +196,7 @@ fn room_detail(ui: &Ui, storage_dir: &Path, config: &AppConfig, idx: usize) -> R
         println!("  [0] Back\r");
         ui.renderer.draw_box_bottom()?;
         stdout().flush()?;
+        crate::sidebar::draw_auto(storage_dir, ui);
 
         let choice = ui.prompt("Choice:")?;
         match choice.trim().to_lowercase().as_str() {

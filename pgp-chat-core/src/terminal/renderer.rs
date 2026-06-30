@@ -13,6 +13,7 @@ use crossterm::{
     },
     terminal::{Clear, ClearType},
 };
+use std::cell::Cell;
 use std::io::{self, stdout, Write};
 
 use super::{
@@ -56,34 +57,41 @@ pub(crate) const ASCII: BorderSet = BorderSet {
 
 /// Owns the detected capability, the color palette, and the border set.
 pub struct Renderer {
-    cap:     TerminalCapability,
-    palette: ColorPalette,
-    borders: BorderSet,
+    cap:          TerminalCapability,
+    palette:      ColorPalette,
+    borders:      BorderSet,
+    active_width: Cell<u16>,
 }
 
 impl Renderer {
     pub fn new(cap: TerminalCapability) -> Self {
+        let w       = cap.width;
         let palette = ColorPalette::for_depth(cap.color_depth);
         let borders = if cap.unicode { UNICODE } else { ASCII };
-        Self { cap, palette, borders }
+        Self { cap, palette, borders, active_width: Cell::new(w) }
     }
 
     /// Build a renderer with chat colors overridden by the given theme.
     pub fn with_theme(cap: TerminalCapability, theme: &ChatTheme) -> Self {
+        let w = cap.width;
         let mut palette = ColorPalette::for_depth(cap.color_depth);
         palette.apply_chat_theme(theme, cap.color_depth);
         let borders = if cap.unicode { UNICODE } else { ASCII };
-        Self { cap, palette, borders }
+        Self { cap, palette, borders, active_width: Cell::new(w) }
     }
 
     pub fn cap(&self)     -> &TerminalCapability { &self.cap }
     pub fn palette(&self) -> &ColorPalette       { &self.palette }
 
+    /// Update the renderer's active width after a terminal resize event.
+    /// Works through a shared reference so it can be called without `&mut Ui`.
+    pub fn set_width(&self, w: u16) { self.active_width.set(w); }
+
     // -----------------------------------------------------------------------
     // Box drawing helpers
     // -----------------------------------------------------------------------
 
-    fn width(&self) -> usize { self.cap.width as usize }
+    fn width(&self) -> usize { self.active_width.get() as usize }
 
     /// Print a horizontal line of `ch` padded to terminal width - 2.
     fn hline(&self, ch: &str) -> String {
