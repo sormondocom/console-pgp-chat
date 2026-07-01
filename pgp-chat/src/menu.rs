@@ -8,7 +8,10 @@ use crossterm::{
     terminal,
     queue,
 };
-use pgp_chat_core::persistence::{self, PersistedRoom};
+use pgp_chat_core::{
+    crypto::identity::PgpIdentity,
+    persistence::{self, PersistedRoom},
+};
 use zeroize::Zeroizing;
 
 use crate::{background, commands, sidebar, ui::Ui};
@@ -53,7 +56,13 @@ pub async fn run() -> Result<()> {
     let storage_dir = persistence::storage_dir();
     let mut config  = persistence::load_config(&storage_dir);
 
-    tokio::spawn(background::run(storage_dir.clone()));
+    let identity = match startup_identity_gate(&storage_dir, &mut config)? {
+        Some(id) => id,
+        None     => return Ok(()),
+    };
+
+    let identity_name = config.active_identity.clone().unwrap_or_default();
+    tokio::spawn(background::run(storage_dir.clone(), identity.fingerprint(), identity_name));
 
     loop {
         let (term_w, _) = terminal::size().unwrap_or((80, 24));
@@ -68,7 +77,7 @@ pub async fn run() -> Result<()> {
 
         let result = match selected {
             MenuItem::StartChat => {
-                commands::chat::run(&ui, &storage_dir, &config, None).await
+                commands::chat::run(&ui, &storage_dir, &config, None, &identity).await
             }
             MenuItem::ManageIdentities => {
                 commands::identity_manager::run(&ui, &storage_dir, &mut config)
@@ -77,7 +86,7 @@ pub async fn run() -> Result<()> {
                 commands::room_manager::run(&ui, &storage_dir, &config)
             }
             MenuItem::ScanPeers => {
-                commands::peer_scanner::run(&ui, &storage_dir, &config).await
+                commands::peer_scanner::run(&ui, &storage_dir, &config, &identity).await
             }
             MenuItem::TrustRequests => {
                 commands::trust_manager::run(&ui, &storage_dir, &config)
@@ -86,7 +95,7 @@ pub async fn run() -> Result<()> {
                 commands::settings::run(&ui, &storage_dir, &mut config)
             }
             MenuItem::StartChatWithContact(idx) => {
-                start_chat_with_contact(&ui, &storage_dir, &config, idx).await
+                start_chat_with_contact(&ui, &storage_dir, &config, idx, &identity).await
             }
             MenuItem::Exit => return Ok(()),
         };
@@ -107,8 +116,10 @@ async fn start_chat_with_contact(
     storage_dir: &std::path::Path,
     config:      &pgp_chat_core::persistence::AppConfig,
     contact_idx: usize,
+    identity:    &PgpIdentity,
 ) -> Result<()> {
-    let store = persistence::load_contacts(storage_dir);
+    let identity_name = config.active_identity.as_deref().unwrap_or("");
+    let store = persistence::load_contacts(storage_dir, identity_name);
     if contact_idx >= store.contacts.len() {
         ui.error("Contact no longer exists.")?;
         return Ok(());
@@ -161,7 +172,94 @@ async fn start_chat_with_contact(
         is_owner:   true,
     };
 
-    commands::chat::run(ui, storage_dir, config, Some((room, None))).await
+    commands::chat::run(ui, storage_dir, config, Some((room, None)), identity).await
+}
+
+// ---------------------------------------------------------------------------
+// Startup identity gate
+// ---------------------------------------------------------------------------
+
+/// Must complete before the main menu is shown.
+///
+/// - No identities: opens Identity Manager; returns `None` if the user quits
+///   without creating one.
+/// - Active identity exists: prompts for passphrase and unlocks it.
+/// - Returns `None` if the user cancels (empty passphrase).
+fn startup_identity_gate(
+    storage_dir: &std::path::Path,
+    config:      &mut pgp_chat_core::persistence::AppConfig,
+) -> Result<Option<PgpIdentity>> {
+    loop {
+        let (term_w, _) = terminal::size().unwrap_or((80, 24));
+        let ui = Ui::from_config_at_width(config, sidebar::main_width(term_w));
+
+        let entries = persistence::load_identity_entries(&config.identities_dir);
+
+        if entries.is_empty() || config.active_identity.is_none() {
+            ui.clear()?;
+            ui.renderer.draw_box_top("pgp-chat")?;
+            if entries.is_empty() {
+                println!("  Welcome!  No PGP identity found.\r");
+                println!("  You need to create or import one to use pgp-chat.\r");
+            } else {
+                println!("  No active identity is set.\r");
+                println!("  Select or create one in Manage Identities.\r");
+            }
+            ui.renderer.draw_box_bottom()?;
+            ui.wait_for_key("Press any key to open Identity Manager...")?;
+
+            commands::identity_manager::run(&ui, storage_dir, config)?;
+
+            // If the user still hasn't set up an identity, exit.
+            let after = persistence::load_identity_entries(&config.identities_dir);
+            if after.is_empty() || config.active_identity.is_none() {
+                return Ok(None);
+            }
+            continue;
+        }
+
+        let name = config.active_identity.as_ref().unwrap().clone();
+        let entry = match entries.iter().find(|e| e.name == name) {
+            Some(e) => e.clone(),
+            None => {
+                // Index is stale — clear the pointer and retry.
+                config.active_identity = None;
+                let _ = persistence::save_config(storage_dir, config);
+                continue;
+            }
+        };
+
+        let armored = match persistence::load_named_identity(&config.identities_dir, &name)? {
+            Some(a) => a,
+            None => {
+                ui.clear()?;
+                ui.error(&format!("Key file for identity '{}' is missing.", name))?;
+                println!("  Use Manage Identities to re-import the key or delete the entry.\r");
+                ui.wait_for_key("Press any key to open Identity Manager...")?;
+                commands::identity_manager::run(&ui, storage_dir, config)?;
+                continue;
+            }
+        };
+
+        ui.clear()?;
+        ui.renderer.draw_box_top("pgp-chat — Unlock Identity")?;
+        println!("\r");
+        ui.info("Identity",    &format!("{} ({})", entry.name, entry.nickname))?;
+        ui.info("Fingerprint", &entry.fingerprint)?;
+        println!("\r");
+        ui.renderer.draw_box_bottom()?;
+
+        loop {
+            let passphrase = ui.prompt_password("Passphrase [Enter to quit]:")?;
+            if passphrase.is_empty() {
+                return Ok(None);
+            }
+            match PgpIdentity::from_armored_secret_key(&entry.nickname, &armored, passphrase) {
+                Ok(id) => return Ok(Some(id)),
+                Err(_) => ui.error("Incorrect passphrase — try again.")?,
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -218,45 +316,55 @@ fn wait_for_selection(
 
                 Event::Key(KeyEvent { code, kind: KeyEventKind::Press, .. }) => {
                     if sidebar_focused {
-                        let contacts = persistence::load_contacts(storage_dir).contacts;
-                        match code {
-                            KeyCode::Tab | KeyCode::Down => {
-                                if !contacts.is_empty() {
-                                    sidebar_idx = (sidebar_idx + 1) % contacts.len();
+                        let total  = sidebar::item_count(storage_dir);
+                        let n_pend = sidebar::pending_count(storage_dir);
+                        if total == 0 {
+                            // List emptied while we were focused — drop focus.
+                            sidebar_focused = false;
+                            let _ = sidebar::draw_with_selection(storage_dir, term_w, unicode, None);
+                        } else {
+                            // Clamp in case the list shrank since last navigation.
+                            if sidebar_idx >= total { sidebar_idx = total - 1; }
+                            match code {
+                                KeyCode::Tab | KeyCode::Down => {
+                                    sidebar_idx = (sidebar_idx + 1) % total;
                                     let _ = sidebar::draw_with_selection(storage_dir, term_w, unicode, Some(sidebar_idx));
                                 }
-                            }
-                            KeyCode::BackTab | KeyCode::Up => {
-                                if !contacts.is_empty() {
+                                KeyCode::BackTab | KeyCode::Up => {
                                     sidebar_idx = if sidebar_idx == 0 {
-                                        contacts.len() - 1
+                                        total - 1
                                     } else {
                                         sidebar_idx - 1
                                     };
                                     let _ = sidebar::draw_with_selection(storage_dir, term_w, unicode, Some(sidebar_idx));
                                 }
+                                KeyCode::Enter => {
+                                    if sidebar_idx < n_pend {
+                                        // Enter on a pending trust request → open Contacts & Trust
+                                        return Ok(MenuItem::TrustRequests);
+                                    } else {
+                                        return Ok(MenuItem::StartChatWithContact(sidebar_idx - n_pend));
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    sidebar_focused = false;
+                                    let _ = sidebar::draw_with_selection(storage_dir, term_w, unicode, None);
+                                }
+                                _ => {}
                             }
-                            KeyCode::Enter => {
-                                return Ok(MenuItem::StartChatWithContact(sidebar_idx));
-                            }
-                            KeyCode::Esc => {
-                                sidebar_focused = false;
-                                let _ = sidebar::draw_with_selection(storage_dir, term_w, unicode, None);
-                            }
-                            _ => {}
                         }
                     } else {
                         match code {
                             KeyCode::Tab => {
-                                let contacts = persistence::load_contacts(storage_dir).contacts;
-                                if !contacts.is_empty() {
+                                let total = sidebar::item_count(storage_dir);
+                                if total > 0 {
                                     sidebar_focused = true;
                                     sidebar_idx = 0;
                                     let _ = sidebar::draw_with_selection(storage_dir, term_w, unicode, Some(0));
                                     let mut out = stdout();
                                     let _ = queue!(out,
                                         SetForegroundColor(Color::DarkGrey),
-                                        Print("  [Tab/↑↓ navigate · Enter select · Esc cancel]"),
+                                        Print("  [↑↓ navigate · Enter select · Esc cancel]"),
                                         ResetColor,
                                     );
                                     let _ = out.flush();
@@ -278,6 +386,12 @@ fn wait_for_selection(
             }
         } else {
             // Timeout — refresh the sidebar in case pending count changed.
+            let total = sidebar::item_count(storage_dir);
+            if sidebar_focused && total == 0 {
+                sidebar_focused = false;
+            } else if sidebar_focused && sidebar_idx >= total {
+                sidebar_idx = total.saturating_sub(1);
+            }
             let sel = if sidebar_focused { Some(sidebar_idx) } else { None };
             let _ = sidebar::draw_with_selection(storage_dir, term_w, unicode, sel);
         }

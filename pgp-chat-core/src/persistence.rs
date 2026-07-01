@@ -120,8 +120,16 @@ pub fn storage_dir() -> PathBuf {
 /// Full path to the identity file inside `dir`.
 pub fn identity_path(dir: &Path) -> PathBuf { dir.join("identity.asc") }
 
-/// Full path to the contacts file inside `dir`.
-pub fn contacts_path(dir: &Path) -> PathBuf { dir.join("contacts.json") }
+/// Full path to the per-identity contacts file inside `dir`.
+///
+/// Pass an empty string to get the legacy global path `contacts.json`.
+pub fn contacts_path(dir: &Path, identity_name: &str) -> PathBuf {
+    if identity_name.is_empty() {
+        dir.join("contacts.json")
+    } else {
+        dir.join(format!("contacts_{}.json", identity_name))
+    }
+}
 
 /// Full path to the rooms list file inside `dir`.
 pub fn rooms_path(dir: &Path) -> PathBuf { dir.join("rooms.json") }
@@ -187,29 +195,41 @@ pub fn load_identity(dir: &Path) -> Result<Option<(String, String)>> {
 // Trust store persistence
 // ---------------------------------------------------------------------------
 
-/// Save the trust store snapshot to `{dir}/contacts.json`.
-pub fn save_contacts(dir: &Path, store: &PersistedTrustStore) -> Result<()> {
+/// Save the trust store snapshot to `{dir}/contacts_{identity_name}.json`.
+pub fn save_contacts(dir: &Path, identity_name: &str, store: &PersistedTrustStore) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let json = serde_json::to_string_pretty(store)?;
-    // Atomic write-then-rename so a crash never leaves a partial contacts file.
-    let path = contacts_path(dir);
-    let tmp = path.with_extension("json.tmp");
+    let path = contacts_path(dir, identity_name);
+    let tmp  = path.with_extension("json.tmp");
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 
-/// Load the trust store from `{dir}/contacts.json`.
+/// Load the trust store from `{dir}/contacts_{identity_name}.json`.
 ///
-/// Returns an empty store if the file does not exist or cannot be parsed
-/// (e.g. after a format migration) rather than propagating an error, so
-/// the application always starts cleanly.
-pub fn load_contacts(dir: &Path) -> PersistedTrustStore {
-    let path = contacts_path(dir);
-    if !path.exists() {
+/// On first run after the per-identity migration, if the per-identity file does
+/// not exist but the legacy `contacts.json` does, copies it across once and
+/// removes the global file so subsequent loads find the right path.
+///
+/// Returns an empty store if no file is found, rather than propagating an error.
+pub fn load_contacts(dir: &Path, identity_name: &str) -> PersistedTrustStore {
+    let per_id_path = contacts_path(dir, identity_name);
+    if !per_id_path.exists() && !identity_name.is_empty() {
+        // One-time migration: move global contacts to this identity's file.
+        let legacy = contacts_path(dir, "");
+        if legacy.exists() {
+            if let Ok(data) = std::fs::read_to_string(&legacy) {
+                if let Ok(store) = serde_json::from_str::<PersistedTrustStore>(&data) {
+                    let _ = save_contacts(dir, identity_name, &store);
+                    let _ = std::fs::remove_file(&legacy);
+                    return store;
+                }
+            }
+        }
         return PersistedTrustStore::default();
     }
-    std::fs::read_to_string(&path)
+    std::fs::read_to_string(&per_id_path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
@@ -348,10 +368,16 @@ pub struct PendingTrustRequest {
     pub received_at:             DateTime<Utc>,
 }
 
-pub fn trust_requests_path(dir: &Path) -> PathBuf { dir.join("trust_requests.json") }
+pub fn trust_requests_path(dir: &Path, identity_name: &str) -> PathBuf {
+    if identity_name.is_empty() {
+        dir.join("trust_requests.json")
+    } else {
+        dir.join(format!("trust_requests_{}.json", identity_name))
+    }
+}
 
-pub fn load_pending_trust_requests(dir: &Path) -> Vec<PendingTrustRequest> {
-    let path = trust_requests_path(dir);
+pub fn load_pending_trust_requests(dir: &Path, identity_name: &str) -> Vec<PendingTrustRequest> {
+    let path = trust_requests_path(dir, identity_name);
     if !path.exists() {
         return Vec::new();
     }
@@ -361,11 +387,11 @@ pub fn load_pending_trust_requests(dir: &Path) -> Vec<PendingTrustRequest> {
         .unwrap_or_default()
 }
 
-pub fn save_pending_trust_requests(dir: &Path, requests: &[PendingTrustRequest]) -> std::io::Result<()> {
+pub fn save_pending_trust_requests(dir: &Path, identity_name: &str, requests: &[PendingTrustRequest]) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let json = serde_json::to_string_pretty(requests)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let path = trust_requests_path(dir);
+    let path = trust_requests_path(dir, identity_name);
     let tmp  = path.with_extension("json.tmp");
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, &path)?;

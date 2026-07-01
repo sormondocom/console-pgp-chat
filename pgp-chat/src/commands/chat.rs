@@ -73,21 +73,19 @@ pub async fn run(
     storage_dir: &Path,
     config:      &AppConfig,
     direct:      Option<(PersistedRoom, Option<libp2p::Multiaddr>)>,
+    identity:    &PgpIdentity,
 ) -> Result<()> {
     // Apply the active theme's system-message color for this session.
     set_system_color(ui.renderer.palette().chat_system);
 
     ui.renderer.draw_box_top("Secure Chat")?;
 
-    // ── PGP identity ───────────────────────────────────────────────────────
-    let pgp_identity = match load_startup_identity(ui, config)? {
-        Some(id) => id,
-        None     => return Ok(()),
-    };
+    let pgp_identity = identity.clone();
     ui.info("PGP Fingerprint", &pgp_identity.fingerprint())?;
 
     // ── Load persisted contacts ────────────────────────────────────────────
-    let persisted_contacts = persistence::load_contacts(&storage_dir);
+    let identity_name = config.active_identity.as_deref().unwrap_or("");
+    let persisted_contacts = persistence::load_contacts(&storage_dir, identity_name);
     let (initial_keystore, loaded_count, failed_count) = build_keystore(&persisted_contacts);
 
     if loaded_count > 0 {
@@ -874,12 +872,12 @@ pub async fn run(
         }
 
         if let Some(ref snapshot) = trust_snapshot {
-            match persistence::save_contacts(&storage_dir, snapshot) {
+            match persistence::save_contacts(&storage_dir, identity_name, snapshot) {
                 Ok(()) => {
                     print_system(&format!(
                         "[+] Saved {} trusted contact(s) to: {}",
                         snapshot.contacts.len(),
-                        persistence::contacts_path(&storage_dir).display()
+                        persistence::contacts_path(&storage_dir, identity_name).display()
                     ))?;
                 }
                 Err(e) => {
@@ -913,87 +911,6 @@ pub async fn run(
 // Identity loading
 // ---------------------------------------------------------------------------
 
-/// Resolve and load the PGP identity for this session.
-///
-/// - If `config.active_identity` is set → load that entry.
-/// - If there is exactly one identity → use it automatically.
-/// - If there are multiple with no active set → prompt the user to pick.
-/// - If no identities exist → print guidance and return `None`.
-fn load_startup_identity(ui: &Ui, config: &AppConfig) -> Result<Option<PgpIdentity>> {
-    let entries = persistence::load_identity_entries(&config.identities_dir);
-
-    if entries.is_empty() {
-        ui.error("No identities found.")?;
-        println!("  Go to Manage Identities from the main menu to create or import a key.\r");
-        println!("  If you have a legacy identity.asc file, use the Import option there.\r");
-        ui.wait_for_key("Press any key to return to the menu...")?;
-        return Ok(None);
-    }
-
-    let entry = if let Some(active_name) = &config.active_identity {
-        match entries.iter().find(|e| &e.name == active_name) {
-            Some(e) => e.clone(),
-            None => {
-                ui.error(&format!("Active identity '{}' not found in index.", active_name))?;
-                println!("  Go to Manage Identities and set a valid active identity.\r");
-                ui.wait_for_key("Press any key...")?;
-                return Ok(None);
-            }
-        }
-    } else if entries.len() == 1 {
-        entries[0].clone()
-    } else {
-        loop {
-            println!("\r");
-            println!("  Select an identity:\r");
-            for (i, e) in entries.iter().enumerate() {
-                println!(
-                    "  [{}] {:<20}  {}  fp: {}…\r",
-                    i + 1, e.name, e.nickname,
-                    &e.fingerprint[..16.min(e.fingerprint.len())]
-                );
-            }
-            let choice = ui.prompt("Choice:")?;
-            if choice.trim().is_empty() {
-                return Ok(None);
-            }
-            if let Ok(idx) = choice.trim().parse::<usize>() {
-                if idx >= 1 && idx <= entries.len() {
-                    break entries[idx - 1].clone();
-                }
-            }
-            ui.error("Invalid choice — try again.")?;
-        }
-    };
-
-    let armored = match persistence::load_named_identity(&config.identities_dir, &entry.name)? {
-        Some(a) => a,
-        None => {
-            ui.error(&format!("Key file for '{}' not found.", entry.name))?;
-            ui.wait_for_key("Press any key...")?;
-            return Ok(None);
-        }
-    };
-
-    println!("\r");
-    println!("  Identity: {}  ({})\r", entry.name, entry.nickname);
-
-    let identity = loop {
-        let passphrase = ui.prompt_password("Key passphrase:")?;
-        match PgpIdentity::from_armored_secret_key(&entry.nickname, &armored, passphrase) {
-            Ok(id) => break id,
-            Err(_) => {
-                ui.error("Incorrect passphrase — could not unlock key.")?;
-                let retry = ui.prompt("Try again? [y/n]:")?;
-                if !retry.trim().eq_ignore_ascii_case("y") {
-                    return Ok(None);
-                }
-            }
-        }
-    };
-
-    Ok(Some(identity))
-}
 
 // ---------------------------------------------------------------------------
 // Startup room selection

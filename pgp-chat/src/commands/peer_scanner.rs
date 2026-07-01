@@ -353,14 +353,14 @@ fn draw_all(
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<()> {
+pub async fn run(ui: &Ui, storage_dir: &Path, config: &AppConfig, identity: &PgpIdentity) -> Result<()> {
     let _ = execute!(stdout(), cursor::Hide);
-    let result = run_scanner(ui, storage_dir, config).await;
+    let result = run_scanner(ui, storage_dir, config, identity).await;
     let _ = execute!(stdout(), cursor::Show);
     result
 }
 
-async fn run_scanner(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<()> {
+async fn run_scanner(ui: &Ui, storage_dir: &Path, config: &AppConfig, identity: &PgpIdentity) -> Result<()> {
     let saved_rooms  = persistence::load_rooms(storage_dir, None);
     let room_by_hash: HashMap<String, String> = saved_rooms.iter()
         .map(|r| (IdentTopic::new(&r.name).hash().to_string(), r.name.clone()))
@@ -504,7 +504,7 @@ async fn run_scanner(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<
                             let (peer_id, info) = list[selected_idx];
                             let _ = execute!(stdout(), cursor::Show);
                             select_room_for_peer(
-                                ui, storage_dir, config,
+                                ui, storage_dir, config, identity,
                                 peer_id, info, &room_by_hash, &saved_rooms,
                             ).await?;
                             return Ok(());
@@ -518,8 +518,8 @@ async fn run_scanner(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<
                             execute!(stdout(),
                                 cursor::MoveTo(0, spin_row(term_h) + 1),
                             )?;
-                            if let Some(identity) = load_identity_for_trust(ui, config) {
-                                match TrustRequestMessage::new(&identity) {
+                            {
+                                match TrustRequestMessage::new(identity) {
                                     Ok(msg) => {
                                         let topic = IdentTopic::new(TRUST_TOPIC);
                                         match sw.behaviour_mut().gossipsub.publish(topic, msg.to_bytes()) {
@@ -647,8 +647,16 @@ async fn run_scanner(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<
                                 // Verify freshness, key/fp consistency, and PGP signature.
                                 if msg.verify().is_err() {
                                     // Silently drop invalid trust requests.
+                                } else if msg.from_fingerprint == identity.fingerprint() {
+                                    // Silently drop our own broadcast.
                                 } else {
-                                let mut reqs = persistence::load_pending_trust_requests(storage_dir);
+                                let id_name = config.active_identity.as_deref().unwrap_or("");
+                                let trust_store = persistence::load_contacts(storage_dir, id_name);
+                                // Skip if already trusted or explicitly rejected.
+                                let skip = trust_store.contacts.iter().any(|c| c.fingerprint == msg.from_fingerprint)
+                                    || trust_store.rejected.iter().any(|fp| fp == &msg.from_fingerprint);
+                                if !skip {
+                                let mut reqs = persistence::load_pending_trust_requests(storage_dir, id_name);
                                 let already = reqs.iter().any(|r| r.from_fingerprint == msg.from_fingerprint);
                                 if !already {
                                     reqs.push(PendingTrustRequest {
@@ -657,10 +665,11 @@ async fn run_scanner(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<
                                         from_public_key_armored: msg.from_public_key_armored,
                                         received_at:             chrono::Utc::now(),
                                     });
-                                    let _ = save_pending_trust_requests(storage_dir, &reqs);
+                                    let _ = save_pending_trust_requests(storage_dir, id_name, &reqs);
                                     // New request arrived — refresh sidebar immediately.
                                     crate::sidebar::draw(storage_dir, term_w, ui.renderer.cap().unicode)?;
                                 }
+                                } // end if !skip
                                 } // end else (verify passed)
                             }
                         }
@@ -728,6 +737,7 @@ async fn select_room_for_peer(
     ui:           &Ui,
     storage_dir:  &Path,
     config:       &AppConfig,
+    identity:     &PgpIdentity,
     peer_id:      &PeerId,
     info:         &PeerInfo,
     room_by_hash: &HashMap<String, String>,
@@ -798,11 +808,11 @@ async fn select_room_for_peer(
                     ui.success(&format!("Joining '{}' — starting chat session.", room.name))?;
                     if let Some(ref addr) = bootstrap { println!("  Bootstrap: {}\r", addr); }
                     println!("\r");
-                    super::chat::run(ui, storage_dir, config, Some((room, bootstrap))).await?;
+                    super::chat::run(ui, storage_dir, config, Some((room, bootstrap)), identity).await?;
                     return Ok(());
                 } else {
                     let hash = &unknown[n - known.len() - 1];
-                    join_unknown_room(ui, storage_dir, config, hash, bootstrap.clone()).await?;
+                    join_unknown_room(ui, storage_dir, config, identity, hash, bootstrap.clone()).await?;
                     return Ok(());
                 }
             }
@@ -819,6 +829,7 @@ async fn join_unknown_room(
     ui:          &Ui,
     storage_dir: &Path,
     config:      &AppConfig,
+    identity:    &PgpIdentity,
     topic_hash:  &str,
     bootstrap:   Option<Multiaddr>,
 ) -> Result<()> {
@@ -848,33 +859,6 @@ async fn join_unknown_room(
     ui.success(&format!("Joining '{}' — starting chat session.", name_input))?;
     if let Some(ref addr) = bootstrap { println!("  Bootstrap: {}\r", addr); }
     println!("\r");
-    super::chat::run(ui, storage_dir, config, Some((room, bootstrap))).await
+    super::chat::run(ui, storage_dir, config, Some((room, bootstrap)), identity).await
 }
 
-// ---------------------------------------------------------------------------
-// Load identity for sending a trust request
-// ---------------------------------------------------------------------------
-
-fn load_identity_for_trust(ui: &Ui, config: &AppConfig) -> Option<PgpIdentity> {
-    let name    = config.active_identity.as_ref()?;
-    let entries = persistence::load_identity_entries(&config.identities_dir);
-    let entry   = entries.into_iter().find(|e| &e.name == name)?;
-    let armored = persistence::load_named_identity(&config.identities_dir, &entry.name)
-        .ok()??;
-
-    println!("\r\n  PGP key passphrase required to sign trust request.\r");
-    let passphrase = ui.prompt_password(&format!(
-        "Key passphrase for '{}' [Enter to cancel]:", entry.nickname
-    )).ok()?;
-    if passphrase.is_empty() {
-        return None;
-    }
-
-    match PgpIdentity::from_armored_secret_key(&entry.nickname, &armored, passphrase) {
-        Ok(id) => Some(id),
-        Err(_) => {
-            let _ = ui.error("Incorrect PGP passphrase.");
-            None
-        }
-    }
-}

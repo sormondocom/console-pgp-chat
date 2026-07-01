@@ -25,16 +25,16 @@ struct BgBehaviour {
     mdns:      mdns::tokio::Behaviour,
 }
 
-pub async fn run(storage_dir: PathBuf) {
+pub async fn run(storage_dir: PathBuf, own_fingerprint: String, identity_name: String) {
     loop {
-        if let Err(e) = run_inner(&storage_dir).await {
+        if let Err(e) = run_inner(&storage_dir, &own_fingerprint, &identity_name).await {
             eprintln!("background trust listener restarting after error: {e}");
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     }
 }
 
-async fn run_inner(storage_dir: &PathBuf) -> anyhow::Result<()> {
+async fn run_inner(storage_dir: &PathBuf, own_fingerprint: &str, identity_name: &str) -> anyhow::Result<()> {
     let keypair    = Keypair::generate_ed25519();
     let peer_id    = keypair.public().to_peer_id();
     let public_key = keypair.public();
@@ -80,7 +80,7 @@ async fn run_inner(storage_dir: &PathBuf) -> anyhow::Result<()> {
             )) => {
                 if message.topic == trust_topic.hash() {
                     if let Some(msg) = TrustRequestMessage::from_bytes(&message.data) {
-                        handle_trust_request(storage_dir, msg);
+                        handle_trust_request(storage_dir, own_fingerprint, identity_name, msg);
                     }
                 }
             }
@@ -96,7 +96,7 @@ async fn run_inner(storage_dir: &PathBuf) -> anyhow::Result<()> {
     }
 }
 
-fn handle_trust_request(storage_dir: &PathBuf, msg: TrustRequestMessage) {
+fn handle_trust_request(storage_dir: &PathBuf, own_fingerprint: &str, identity_name: &str, msg: TrustRequestMessage) {
     // Verify freshness, key/fingerprint consistency, and PGP signature.
     // Silently discard any message that fails these checks.
     if let Err(e) = msg.verify() {
@@ -104,7 +104,23 @@ fn handle_trust_request(storage_dir: &PathBuf, msg: TrustRequestMessage) {
         return;
     }
 
-    let mut requests = persistence::load_pending_trust_requests(storage_dir);
+    // Discard our own broadcast (background listener receives it too).
+    if msg.from_fingerprint == own_fingerprint {
+        return;
+    }
+
+    let trust_store = persistence::load_contacts(storage_dir, identity_name);
+
+    // Peer is already trusted — no need to re-queue a request.
+    if trust_store.contacts.iter().any(|c| c.fingerprint == msg.from_fingerprint) {
+        return;
+    }
+    // Peer was explicitly rejected — silently discard.
+    if trust_store.rejected.iter().any(|fp| fp == &msg.from_fingerprint) {
+        return;
+    }
+
+    let mut requests = persistence::load_pending_trust_requests(storage_dir, identity_name);
     let already = requests.iter().any(|r| r.from_fingerprint == msg.from_fingerprint);
     if !already {
         requests.push(PendingTrustRequest {
@@ -113,7 +129,7 @@ fn handle_trust_request(storage_dir: &PathBuf, msg: TrustRequestMessage) {
             from_public_key_armored: msg.from_public_key_armored,
             received_at:             Utc::now(),
         });
-        if let Err(e) = persistence::save_pending_trust_requests(storage_dir, &requests) {
+        if let Err(e) = persistence::save_pending_trust_requests(storage_dir, identity_name, &requests) {
             eprintln!("failed to save pending trust request: {e}");
         } else {
             // Ring terminal bell so the user notices regardless of which screen they're on.
