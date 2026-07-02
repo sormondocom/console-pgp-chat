@@ -8,7 +8,12 @@ use std::io::Cursor;
 use crate::crypto::{identity::PgpIdentity, sign};
 use crate::error::{Error, Result};
 
-pub const TRUST_TOPIC: &str = "pgp-chat-trust-v1";
+pub const TRUST_TOPIC:     &str = "pgp-chat-trust-v1";
+
+/// Gossipsub topic where peers broadcast a signed announcement of their PGP
+/// fingerprint when they connect.  Allows the scanner to map libp2p PeerIds
+/// to PGP identities and detect trusted contacts without a prior trust exchange.
+pub const ANNOUNCE_TOPIC:  &str = "pgp-chat-announce-v1";
 
 /// Maximum age (seconds) for an incoming trust request — older ones are replays.
 pub const TRUST_MAX_AGE_SECS: i64 = 1800; // 30 minutes

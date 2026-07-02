@@ -3,17 +3,18 @@ use std::path::Path;
 
 use anyhow::Result;
 use chrono::Utc;
-use pgp_chat_core::persistence::{
-    self, AppConfig, PersistedContact, PersistedTrustStore,
+use pgp_chat_core::{
+    crypto::identity::PgpIdentity,
+    persistence::{self, AppConfig, PersistedContact, PersistedTrustStore},
 };
 
 use crate::ui::Ui;
 
-pub fn run(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<()> {
+pub fn run(ui: &Ui, storage_dir: &Path, config: &AppConfig, identity: &PgpIdentity) -> Result<()> {
     let identity_name = config.active_identity.as_deref().unwrap_or("");
     loop {
-        let store    = persistence::load_contacts(storage_dir, identity_name);
-        let mut pending = persistence::load_pending_trust_requests(storage_dir, identity_name);
+        let store    = persistence::load_contacts(storage_dir, identity_name, identity);
+        let mut pending = persistence::load_pending_trust_requests(storage_dir, identity_name, identity);
 
         ui.clear()?;
         ui.renderer.draw_box_top("Contacts & Trust")?;
@@ -61,7 +62,7 @@ pub fn run(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<()> {
         println!("  [0] Back\r");
         ui.renderer.draw_box_bottom()?;
         stdout().flush()?;
-        crate::sidebar::draw_auto(storage_dir, ui);
+        crate::sidebar::draw_auto(storage_dir, ui, Some(identity));
 
         let choice = ui.prompt("Choice:")?;
         let choice = choice.trim().to_string();
@@ -102,12 +103,12 @@ pub fn run(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<()> {
                             if let Err(e) = persistence::parse_contact(&tmp) {
                                 ui.error(&format!("Key fingerprint mismatch — request is invalid: {e}"))?;
                                 pending.remove(idx);
-                                persistence::save_pending_trust_requests(storage_dir, identity_name, &pending)?;
+                                persistence::save_pending_trust_requests(storage_dir, identity_name, &pending, identity)?;
                                 ui.wait_for_key("Press any key...")?;
                                 continue;
                             }
 
-                            let mut store = persistence::load_contacts(storage_dir, identity_name);
+                            let mut store = persistence::load_contacts(storage_dir, identity_name, identity);
                             let already = store.contacts.iter()
                                 .any(|c| c.fingerprint == req.from_fingerprint);
                             if !already {
@@ -117,10 +118,10 @@ pub fn run(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<()> {
                                     armored_public_key: req.from_public_key_armored.clone(),
                                     last_seen:          Some(Utc::now()),
                                 });
-                                persistence::save_contacts(storage_dir, identity_name, &store)?;
+                                persistence::save_contacts(storage_dir, identity_name, &store, identity)?;
                             }
                             pending.remove(idx);
-                            persistence::save_pending_trust_requests(storage_dir, identity_name, &pending)?;
+                            persistence::save_pending_trust_requests(storage_dir, identity_name, &pending, identity)?;
                             ui.success(&format!("Accepted trust from {}.", req.from_nickname))?;
                             println!("  Note: they won't have you as a contact yet.\r");
                             println!("  Open Scan for Peers (menu 4) and press [T] to\r");
@@ -128,13 +129,13 @@ pub fn run(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<()> {
                             ui.wait_for_key("Press any key...")?;
                         }
                         "r" => {
-                            let mut store: PersistedTrustStore = persistence::load_contacts(storage_dir, identity_name);
+                            let mut store: PersistedTrustStore = persistence::load_contacts(storage_dir, identity_name, identity);
                             if !store.rejected.contains(&req.from_fingerprint) {
                                 store.rejected.push(req.from_fingerprint.clone());
-                                persistence::save_contacts(storage_dir, identity_name, &store)?;
+                                persistence::save_contacts(storage_dir, identity_name, &store, identity)?;
                             }
                             pending.remove(idx);
-                            persistence::save_pending_trust_requests(storage_dir, identity_name, &pending)?;
+                            persistence::save_pending_trust_requests(storage_dir, identity_name, &pending, identity)?;
                             ui.error(&format!("Rejected trust from {}.", req.from_nickname))?;
                             ui.wait_for_key("Press any key...")?;
                         }

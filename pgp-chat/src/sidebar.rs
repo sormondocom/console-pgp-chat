@@ -2,7 +2,10 @@ use std::io::{stdout, Write};
 use std::path::Path;
 
 use crossterm::{cursor, execute, queue, style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor}};
-use pgp_chat_core::persistence::{self, PendingTrustRequest, PersistedTrustStore};
+use pgp_chat_core::{
+    crypto::identity::PgpIdentity,
+    persistence::{self, PendingTrustRequest, PersistedTrustStore},
+};
 
 use crate::ui::Ui;
 
@@ -25,23 +28,15 @@ fn active_identity_name(storage_dir: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Total navigable items in the combined pending-then-contacts list.
-/// The index space matches the `selected` parameter of `draw_with_selection`.
-pub fn item_count(storage_dir: &Path) -> usize {
-    let name = active_identity_name(storage_dir);
-    persistence::load_pending_trust_requests(storage_dir, &name).len()
-        + persistence::load_contacts(storage_dir, &name).contacts.len()
-}
-
 /// Number of pending trust requests.
-pub fn pending_count(storage_dir: &Path) -> usize {
+pub fn pending_count(storage_dir: &Path, identity: &PgpIdentity) -> usize {
     let name = active_identity_name(storage_dir);
-    persistence::load_pending_trust_requests(storage_dir, &name).len()
+    persistence::load_pending_trust_requests(storage_dir, &name, identity).len()
 }
 
 /// Draw sidebar or compact badge. Saves and restores cursor position.
-pub fn draw(storage_dir: &Path, term_w: u16, unicode: bool) -> std::io::Result<()> {
-    draw_with_selection(storage_dir, term_w, unicode, None)
+pub fn draw(storage_dir: &Path, term_w: u16, unicode: bool, identity: &PgpIdentity) -> std::io::Result<()> {
+    draw_with_selection(storage_dir, term_w, unicode, None, identity)
 }
 
 /// Draw sidebar with one item optionally highlighted (Tab navigation).
@@ -54,19 +49,23 @@ pub fn draw_with_selection(
     term_w:      u16,
     unicode:     bool,
     selected:    Option<usize>,
+    identity:    &PgpIdentity,
 ) -> std::io::Result<()> {
     let (_, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
     if has_sidebar(term_w) {
-        draw_full(storage_dir, term_w, term_h, unicode, selected)
+        draw_full(storage_dir, term_w, term_h, unicode, selected, identity)
     } else {
-        draw_badge(storage_dir, term_w, unicode)
+        draw_badge(storage_dir, term_w, unicode, identity)
     }
 }
 
 /// Convenience wrapper: reads terminal size and unicode flag from the Ui.
-pub fn draw_auto(storage_dir: &Path, ui: &Ui) {
-    if let Ok((w, _)) = crossterm::terminal::size() {
-        let _ = draw(storage_dir, w, ui.renderer.cap().unicode);
+/// Pass `None` for identity when no identity is loaded (startup gate); the sidebar is skipped.
+pub fn draw_auto(storage_dir: &Path, ui: &Ui, identity: Option<&PgpIdentity>) {
+    if let Some(id) = identity {
+        if let Ok((w, _)) = crossterm::terminal::size() {
+            let _ = draw(storage_dir, w, ui.renderer.cap().unicode, id);
+        }
     }
 }
 
@@ -76,10 +75,11 @@ fn draw_full(
     term_h:      u16,
     unicode:     bool,
     selected:    Option<usize>,
+    identity:    &PgpIdentity,
 ) -> std::io::Result<()> {
     let name   = active_identity_name(storage_dir);
-    let store  = persistence::load_contacts(storage_dir, &name);
-    let pend   = persistence::load_pending_trust_requests(storage_dir, &name);
+    let store  = persistence::load_contacts(storage_dir, &name, identity);
+    let pend   = persistence::load_pending_trust_requests(storage_dir, &name, identity);
     let n_pend = pend.len();
     let x      = term_w - SIDEBAR_W;
 
@@ -360,10 +360,10 @@ fn flush_restore(out: &mut std::io::Stdout) -> std::io::Result<()> {
     out.flush()
 }
 
-fn draw_badge(storage_dir: &Path, term_w: u16, unicode: bool) -> std::io::Result<()> {
+fn draw_badge(storage_dir: &Path, term_w: u16, unicode: bool, identity: &PgpIdentity) -> std::io::Result<()> {
     let name       = active_identity_name(storage_dir);
-    let pending_n  = persistence::load_pending_trust_requests(storage_dir, &name).len();
-    let contacts_n = persistence::load_contacts(storage_dir, &name).contacts.len();
+    let pending_n  = persistence::load_pending_trust_requests(storage_dir, &name, identity).len();
+    let contacts_n = persistence::load_contacts(storage_dir, &name, identity).contacts.len();
     let star       = if unicode { "★" } else { "*" };
 
     let badge = if pending_n > 0 {

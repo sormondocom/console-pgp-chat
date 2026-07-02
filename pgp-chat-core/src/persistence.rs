@@ -131,8 +131,16 @@ pub fn contacts_path(dir: &Path, identity_name: &str) -> PathBuf {
     }
 }
 
-/// Full path to the rooms list file inside `dir`.
-pub fn rooms_path(dir: &Path) -> PathBuf { dir.join("rooms.json") }
+/// Full path to the per-identity rooms file inside `dir`.
+///
+/// Pass an empty string to get the legacy global path `rooms.json`.
+pub fn rooms_path(dir: &Path, identity_name: &str) -> PathBuf {
+    if identity_name.is_empty() {
+        dir.join("rooms.json")
+    } else {
+        dir.join(format!("rooms_{}.json", identity_name))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Identity persistence
@@ -195,44 +203,80 @@ pub fn load_identity(dir: &Path) -> Result<Option<(String, String)>> {
 // Trust store persistence
 // ---------------------------------------------------------------------------
 
-/// Save the trust store snapshot to `{dir}/contacts_{identity_name}.json`.
-pub fn save_contacts(dir: &Path, identity_name: &str, store: &PersistedTrustStore) -> Result<()> {
+/// Encrypt arbitrary string content for per-identity storage.
+/// Returns `pgpenc:<hex(PGP packet bytes)>` on success.
+fn encrypt_file_content(content: &str, identity: &PgpIdentity) -> Result<String> {
+    let bytes = encrypt::encrypt_for_recipients(content.as_bytes(), &[identity.public_key()])?;
+    Ok(format!("{}{}", PASSPHRASE_ENC_PREFIX, hex::encode(bytes)))
+}
+
+/// Decrypt content produced by `encrypt_file_content`.
+/// Returns the plaintext, or the original string unchanged if not encrypted or decryption fails.
+fn decrypt_file_content(stored: &str, identity: &PgpIdentity) -> String {
+    stored.strip_prefix(PASSPHRASE_ENC_PREFIX)
+        .and_then(|hex_part| hex::decode(hex_part).ok())
+        .and_then(|bytes| {
+            encrypt::decrypt_message(&bytes, identity.secret_key(), identity.passphrase_fn()).ok()
+        })
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| stored.to_string())
+}
+
+/// Save the trust store snapshot to `{dir}/contacts_{identity_name}.json` (PGP-encrypted).
+pub fn save_contacts(dir: &Path, identity_name: &str, store: &PersistedTrustStore, identity: &PgpIdentity) -> Result<()> {
     std::fs::create_dir_all(dir)?;
-    let json = serde_json::to_string_pretty(store)?;
+    let json      = serde_json::to_string_pretty(store)?;
+    let encrypted = encrypt_file_content(&json, identity)?;
     let path = contacts_path(dir, identity_name);
     let tmp  = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)?;
+    std::fs::write(&tmp, encrypted)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 
 /// Load the trust store from `{dir}/contacts_{identity_name}.json`.
 ///
-/// On first run after the per-identity migration, if the per-identity file does
-/// not exist but the legacy `contacts.json` does, copies it across once and
-/// removes the global file so subsequent loads find the right path.
+/// Handles both encrypted (post-migration) and plain-JSON (legacy) files transparently.
+/// On first run, if the per-identity file is absent but a legacy `contacts.json` exists,
+/// migrates it: saves encrypted to the per-identity path and removes the global file.
 ///
-/// Returns an empty store if no file is found, rather than propagating an error.
-pub fn load_contacts(dir: &Path, identity_name: &str) -> PersistedTrustStore {
+/// Returns an empty store if no file is found.
+pub fn load_contacts(dir: &Path, identity_name: &str, identity: &PgpIdentity) -> PersistedTrustStore {
     let per_id_path = contacts_path(dir, identity_name);
-    if !per_id_path.exists() && !identity_name.is_empty() {
-        // One-time migration: move global contacts to this identity's file.
+
+    let (raw, from_legacy) = if per_id_path.exists() {
+        match std::fs::read_to_string(&per_id_path).ok() {
+            Some(c) => (c, false),
+            None    => return PersistedTrustStore::default(),
+        }
+    } else if !identity_name.is_empty() {
         let legacy = contacts_path(dir, "");
         if legacy.exists() {
-            if let Ok(data) = std::fs::read_to_string(&legacy) {
-                if let Ok(store) = serde_json::from_str::<PersistedTrustStore>(&data) {
-                    let _ = save_contacts(dir, identity_name, &store);
-                    let _ = std::fs::remove_file(&legacy);
-                    return store;
-                }
+            match std::fs::read_to_string(&legacy).ok() {
+                Some(c) => (c, true),
+                None    => return PersistedTrustStore::default(),
             }
+        } else {
+            return PersistedTrustStore::default();
         }
+    } else {
         return PersistedTrustStore::default();
+    };
+
+    let json = if raw.starts_with(PASSPHRASE_ENC_PREFIX) {
+        decrypt_file_content(&raw, identity)
+    } else {
+        raw
+    };
+
+    let store: PersistedTrustStore = serde_json::from_str(&json).unwrap_or_default();
+
+    if from_legacy {
+        let _ = save_contacts(dir, identity_name, &store, identity);
+        let _ = std::fs::remove_file(contacts_path(dir, ""));
     }
-    std::fs::read_to_string(&per_id_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+
+    store
 }
 
 // ---------------------------------------------------------------------------
@@ -269,82 +313,96 @@ impl Drop for PersistedRoom {
     }
 }
 
-/// Load the persisted room list from `{dir}/rooms.json`.
+/// Load the persisted room list from `{dir}/rooms_{identity_name}.json`.
 ///
-/// When `identity` is `Some`, passphrases that carry the `pgpenc:` prefix are
-/// decrypted using that identity's secret key so callers always receive the
-/// plaintext value in `PersistedRoom::passphrase`.
+/// The whole file is PGP-encrypted.  Individual room passphrases are returned
+/// as-is (still carrying their `pgpenc:` prefix).  Callers that need the
+/// plaintext passphrase must call [`decrypt_room_passphrase`] themselves — this
+/// avoids one S2K key-unlock per room on every list refresh.
 ///
-/// When `identity` is `None` the raw stored value is returned — useful when
-/// only `PersistedRoom::name` is needed (e.g. the peer scanner).
+/// On first run, if the per-identity file is absent but a legacy `rooms.json`
+/// exists, migrates it: saves encrypted to the per-identity path and removes
+/// the global file.
 ///
-/// Returns an empty list if the file does not exist or cannot be parsed.
-pub fn load_rooms(dir: &Path, identity: Option<&PgpIdentity>) -> Vec<PersistedRoom> {
-    let path = rooms_path(dir);
-    if !path.exists() {
-        return Vec::new();
-    }
-    let raw: Vec<PersistedRoom> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+/// Returns an empty list if no file is found or parsing fails.
+pub fn load_rooms(dir: &Path, identity_name: &str, identity: &PgpIdentity) -> Vec<PersistedRoom> {
+    let per_id_path = rooms_path(dir, identity_name);
 
-    if let Some(id) = identity {
-        raw.into_iter().map(|r| PersistedRoom {
-            name:       r.name.clone(),
-            passphrase: decrypt_room_passphrase(&r.passphrase, id),
-            is_owner:   r.is_owner,
-        }).collect()
+    let (raw, from_legacy) = if per_id_path.exists() {
+        match std::fs::read_to_string(&per_id_path).ok() {
+            Some(c) => (c, false),
+            None    => return Vec::new(),
+        }
+    } else if !identity_name.is_empty() {
+        let legacy = rooms_path(dir, "");
+        if legacy.exists() {
+            match std::fs::read_to_string(&legacy).ok() {
+                Some(c) => (c, true),
+                None    => return Vec::new(),
+            }
+        } else {
+            return Vec::new();
+        }
+    } else {
+        return Vec::new();
+    };
+
+    let json = if raw.starts_with(PASSPHRASE_ENC_PREFIX) {
+        decrypt_file_content(&raw, identity)
     } else {
         raw
+    };
+
+    let rooms: Vec<PersistedRoom> = serde_json::from_str(&json).unwrap_or_default();
+
+    if from_legacy {
+        let _ = save_rooms(dir, identity_name, &rooms, identity);
+        let _ = std::fs::remove_file(rooms_path(dir, ""));
     }
+
+    rooms
 }
 
-/// Save the room list to `{dir}/rooms.json`.
+/// Save the room list to `{dir}/rooms_{identity_name}.json`.
 ///
-/// When `identity` is `Some`, each room passphrase that is not already
-/// encrypted is PGP-encrypted to that identity's public key before writing.
-/// Passphrases that already carry the `pgpenc:` prefix are left as-is (they
-/// were encrypted on a previous save to the same key).
-///
-/// When `identity` is `None` the plaintext values are written unchanged —
-/// useful from the room manager which doesn't hold a loaded identity; the chat
-/// session will re-encrypt on its next save.
+/// Each room passphrase is PGP-encrypted to the identity's public key, then the
+/// entire JSON blob is also PGP-encrypted as a whole-file envelope.  This means
+/// nothing in the file (room names or passphrases) is readable without the
+/// identity's secret key.
 ///
 /// Uses an atomic write-then-rename so a crash never leaves a partial file.
 pub fn save_rooms(
-    dir:      &Path,
-    rooms:    &[PersistedRoom],
-    identity: Option<&PgpIdentity>,
+    dir:           &Path,
+    identity_name: &str,
+    rooms:         &[PersistedRoom],
+    identity:      &PgpIdentity,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
 
-    let rooms_on_disk: Vec<PersistedRoom> = if let Some(id) = identity {
-        rooms.iter().map(|r| {
-            let pass = if passphrase_is_encrypted(&r.passphrase) {
-                r.passphrase.clone()
-            } else {
-                encrypt_room_passphrase(&r.passphrase, id)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
-            };
-            Ok(PersistedRoom {
-                name:       r.name.clone(),
-                passphrase: pass,
-                is_owner:   r.is_owner,
-            })
-        }).collect::<std::io::Result<Vec<_>>>()?
-    } else {
-        rooms.to_vec()
-    };
+    let rooms_on_disk: Vec<PersistedRoom> = rooms.iter().map(|r| {
+        let pass = if passphrase_is_encrypted(&r.passphrase) {
+            r.passphrase.clone()
+        } else {
+            encrypt_room_passphrase(&r.passphrase, identity)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+        };
+        Ok(PersistedRoom {
+            name:       r.name.clone(),
+            passphrase: pass,
+            is_owner:   r.is_owner,
+        })
+    }).collect::<std::io::Result<Vec<_>>>()?;
 
     let json = serde_json::to_string_pretty(&rooms_on_disk)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let path = rooms_path(dir);
+    let encrypted = encrypt_file_content(&json, identity)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+    let path = rooms_path(dir, identity_name);
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)?;
+    std::fs::write(&tmp, encrypted)?;
     std::fs::rename(&tmp, &path)?;
 
-    // Restrict read access on Unix — rooms.json contains AES-256 room keys.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -376,24 +434,93 @@ pub fn trust_requests_path(dir: &Path, identity_name: &str) -> PathBuf {
     }
 }
 
-pub fn load_pending_trust_requests(dir: &Path, identity_name: &str) -> Vec<PendingTrustRequest> {
+pub fn load_pending_trust_requests(dir: &Path, identity_name: &str, identity: &PgpIdentity) -> Vec<PendingTrustRequest> {
     let path = trust_requests_path(dir, identity_name);
     if !path.exists() {
         return Vec::new();
     }
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let raw = match std::fs::read_to_string(&path).ok() {
+        Some(c) => c,
+        None    => return Vec::new(),
+    };
+    let json = if raw.starts_with(PASSPHRASE_ENC_PREFIX) {
+        decrypt_file_content(&raw, identity)
+    } else {
+        raw
+    };
+    serde_json::from_str(&json).unwrap_or_default()
 }
 
-pub fn save_pending_trust_requests(dir: &Path, identity_name: &str, requests: &[PendingTrustRequest]) -> std::io::Result<()> {
+pub fn save_pending_trust_requests(dir: &Path, identity_name: &str, requests: &[PendingTrustRequest], identity: &PgpIdentity) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let json = serde_json::to_string_pretty(requests)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let encrypted = encrypt_file_content(&json, identity)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     let path = trust_requests_path(dir, identity_name);
     let tmp  = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)?;
+    std::fs::write(&tmp, encrypted)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Per-identity preferences
+// ---------------------------------------------------------------------------
+
+/// Per-identity settings (theme, saved themes).  Stored encrypted in
+/// `{storage_dir}/prefs_{name}.json` so each identity has its own look.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityPrefs {
+    #[serde(default)]
+    pub chat_theme:   ChatTheme,
+    #[serde(default)]
+    pub saved_themes: Vec<ChatTheme>,
+}
+
+impl Default for IdentityPrefs {
+    fn default() -> Self {
+        Self { chat_theme: ChatTheme::default(), saved_themes: Vec::new() }
+    }
+}
+
+pub fn identity_prefs_path(dir: &Path, identity_name: &str) -> PathBuf {
+    dir.join(format!("prefs_{}.json", identity_name))
+}
+
+/// Load per-identity prefs from `{dir}/prefs_{name}.json`.
+///
+/// If the per-identity prefs file does not yet exist, initialises from
+/// the theme stored in the global `config.json` (one-time migration).
+pub fn load_identity_prefs(dir: &Path, identity_name: &str, identity: &PgpIdentity) -> IdentityPrefs {
+    let path = identity_prefs_path(dir, identity_name);
+    if !path.exists() {
+        let prefs = IdentityPrefs {
+            chat_theme:   load_config(dir).chat_theme,
+            saved_themes: load_config(dir).saved_themes,
+        };
+        let _ = save_identity_prefs(dir, identity_name, &prefs, identity);
+        return prefs;
+    }
+    let raw = match std::fs::read_to_string(&path).ok() {
+        Some(c) => c,
+        None    => return IdentityPrefs::default(),
+    };
+    let json = if raw.starts_with(PASSPHRASE_ENC_PREFIX) {
+        decrypt_file_content(&raw, identity)
+    } else {
+        raw
+    };
+    serde_json::from_str(&json).unwrap_or_default()
+}
+
+pub fn save_identity_prefs(dir: &Path, identity_name: &str, prefs: &IdentityPrefs, identity: &PgpIdentity) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let json      = serde_json::to_string_pretty(prefs)?;
+    let encrypted = encrypt_file_content(&json, identity)?;
+    let path = identity_prefs_path(dir, identity_name);
+    let tmp  = path.with_extension("json.tmp");
+    std::fs::write(&tmp, encrypted)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
@@ -512,7 +639,15 @@ pub fn default_downloads_dir() -> PathBuf {
     base.join("Downloads")
 }
 
-/// Persisted application configuration.
+/// Global application configuration (non-sensitive, unencrypted).
+///
+/// Only stores path settings and the active identity pointer.  Per-identity
+/// preferences (theme, saved themes) live in the encrypted `IdentityPrefs`
+/// file so each identity has independent settings.
+///
+/// `chat_theme` / `saved_themes` are kept for one-time migration: they are
+/// read by `load_identity_prefs` when creating the per-identity prefs file for
+/// the first time and are otherwise ignored by the runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// Directory where per-identity `.asc` files and the index live.
@@ -521,10 +656,10 @@ pub struct AppConfig {
     pub downloads_dir:   PathBuf,
     /// Name slug of the identity that loads automatically at startup.
     pub active_identity: Option<String>,
-    /// Active chat color theme.
+    /// Legacy — read once to seed `IdentityPrefs`; use `IdentityPrefs.chat_theme` instead.
     #[serde(default)]
     pub chat_theme:      ChatTheme,
-    /// User-saved named themes.
+    /// Legacy — same as above.
     #[serde(default)]
     pub saved_themes:    Vec<ChatTheme>,
 }

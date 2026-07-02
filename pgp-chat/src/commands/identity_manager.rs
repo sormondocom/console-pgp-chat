@@ -14,7 +14,15 @@ use crate::ui::Ui;
 // Public entry point
 // ---------------------------------------------------------------------------
 
-pub fn run(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<()> {
+/// Run the identity manager.
+///
+/// Returns `Ok(Some(identity))` when a new identity was just created or
+/// imported *and* set as active — the caller (startup gate) can use it
+/// directly without prompting for the passphrase again.
+///
+/// Returns `Ok(None)` in all other cases (user backed out, called from main
+/// menu after an existing session is already established).
+pub fn run(ui: &Ui, storage_dir: &Path, config: &mut AppConfig, identity: Option<&PgpIdentity>) -> Result<Option<PgpIdentity>> {
     loop {
         let entries = persistence::load_identity_entries(&config.identities_dir);
 
@@ -24,8 +32,13 @@ pub fn run(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<()> {
         if entries.is_empty() {
             println!("  No identities stored.  Use [n] to create your first identity.\r");
         } else {
+            // Fixed overhead: "  [NN]  " (7) + two "  " gaps (4) + fp_short ~18 + "  ◀ active" (10) = 39
+            // Split remaining width 55/45 between name and nickname; preserve 80-col defaults.
+            let avail    = (ui.renderer.cap().width as usize).saturating_sub(39);
+            let name_w   = (avail * 55 / 100).clamp(8, 22);
+            let nick_w   = (avail * 45 / 100).clamp(6, 20);
             println!(
-                "  {:<3}  {:<20}  {:<18}  {}\r",
+                "  {:<3}  {:<name_w$}  {:<nick_w$}  {}\r",
                 "#", "Name", "Nickname", "Fingerprint (first 16 chars)"
             );
             ui.renderer.draw_box_separator()?;
@@ -37,7 +50,7 @@ pub fn run(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<()> {
                     ""
                 };
                 println!(
-                    "  [{:<2}]  {:<20}  {:<18}  {}{}\r",
+                    "  [{:<2}]  {:<name_w$}  {:<nick_w$}  {}{}\r",
                     i + 1, e.name, e.nickname, fp_short, active
                 );
             }
@@ -54,15 +67,23 @@ pub fn run(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<()> {
         println!("  [0] Back\r");
         ui.renderer.draw_box_bottom()?;
         stdout().flush()?;
-        crate::sidebar::draw_auto(storage_dir, ui);
+        crate::sidebar::draw_auto(storage_dir, ui, identity);
 
         let choice = ui.prompt("Choice:")?;
         let choice = choice.trim().to_lowercase();
 
         match choice.as_str() {
-            "0" | "" => return Ok(()),
-            "n"      => create_identity(ui, config, storage_dir)?,
-            "i"      => import_identity(ui, config, storage_dir)?,
+            "0" | "" => return Ok(None),
+            "n" => {
+                if let Some(new_id) = create_identity(ui, config, storage_dir)? {
+                    return Ok(Some(new_id));
+                }
+            }
+            "i" => {
+                if let Some(new_id) = import_identity(ui, config, storage_dir)? {
+                    return Ok(Some(new_id));
+                }
+            }
             "d" if !entries.is_empty() => delete_identity(ui, config, &entries, storage_dir)?,
             _ => {
                 if let Ok(idx) = choice.parse::<usize>() {
@@ -85,7 +106,7 @@ pub fn run(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<()> {
 // Create a new identity
 // ---------------------------------------------------------------------------
 
-fn create_identity(ui: &Ui, config: &mut AppConfig, storage_dir: &Path) -> Result<()> {
+fn create_identity(ui: &Ui, config: &mut AppConfig, storage_dir: &Path) -> Result<Option<PgpIdentity>> {
     ui.renderer.draw_box_top("New Identity")?;
     println!("  Generates a fresh PGP keypair:\r");
     println!("    Primary key: EdDSA (sign + certify)\r");
@@ -94,10 +115,9 @@ fn create_identity(ui: &Ui, config: &mut AppConfig, storage_dir: &Path) -> Resul
 
     let entries = persistence::load_identity_entries(&config.identities_dir);
 
-    // Unique name slug
     let name = prompt_unique_name(ui, &entries, "Identity name (unique label e.g. \"work\", \"personal\"):")?;
     if name.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let nickname = ui.prompt("Display nickname (shown to peers in chat):")?;
@@ -112,24 +132,24 @@ fn create_identity(ui: &Ui, config: &mut AppConfig, storage_dir: &Path) -> Resul
         if *passphrase != *confirm {
             ui.error("Passphrases do not match — cancelled.")?;
             ui.wait_for_key("Press any key...")?;
-            return Ok(());
+            return Ok(None);
         }
     }
 
-    println!("  Generating EdDSA + ECDH keypair for \"{}\"…\r", nickname);
+    println!("  Generating EdDSA + ECDH keypair for [{}] \"{}\"…\r", name, nickname);
 
     let identity = PgpIdentity::generate(&nickname, passphrase)
         .map_err(|e| anyhow::anyhow!("Key generation failed: {e}"))?;
 
-    persist_identity(ui, config, storage_dir, &name, &nickname, &identity, &entries)?;
-    Ok(())
+    let identity = persist_identity(ui, config, storage_dir, &name, &nickname, identity, &entries)?;
+    Ok(identity)
 }
 
 // ---------------------------------------------------------------------------
 // Import an existing PGP secret key
 // ---------------------------------------------------------------------------
 
-fn import_identity(ui: &Ui, config: &mut AppConfig, storage_dir: &Path) -> Result<()> {
+fn import_identity(ui: &Ui, config: &mut AppConfig, storage_dir: &Path) -> Result<Option<PgpIdentity>> {
     ui.renderer.draw_box_top("Import PGP Secret Key")?;
     println!("  Provide your SECRET key file.\r");
     println!("  The file must begin with:  -----BEGIN PGP PRIVATE KEY BLOCK-----\r");
@@ -140,7 +160,7 @@ fn import_identity(ui: &Ui, config: &mut AppConfig, storage_dir: &Path) -> Resul
 
     let name = prompt_unique_name(ui, &entries, "Identity name (unique label):")?;
     if name.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let nickname = ui.prompt("Display nickname:")?;
@@ -151,7 +171,7 @@ fn import_identity(ui: &Ui, config: &mut AppConfig, storage_dir: &Path) -> Resul
     if path.is_empty() {
         println!("  Cancelled.\r");
         ui.wait_for_key("Press any key...")?;
-        return Ok(());
+        return Ok(None);
     }
 
     let armored = std::fs::read_to_string(&path)
@@ -166,13 +186,12 @@ fn import_identity(ui: &Ui, config: &mut AppConfig, storage_dir: &Path) -> Resul
                 let retry = ui.prompt("Try again? [y/n]:")?;
                 if !retry.trim().eq_ignore_ascii_case("y") {
                     println!("  Import cancelled.\r");
-                    return Ok(());
+                    return Ok(None);
                 }
             }
         }
     };
 
-    // Store the imported armored key (the key file the user gave us, not a re-exported copy)
     persistence::save_named_identity(&config.identities_dir, &name, &armored)
         .with_context(|| "Failed to save key to identities directory")?;
 
@@ -191,9 +210,13 @@ fn import_identity(ui: &Ui, config: &mut AppConfig, storage_dir: &Path) -> Resul
     ui.info("Fingerprint", &identity.fingerprint())?;
     ui.info("Key file",    &key_path.display().to_string())?;
 
-    maybe_set_active(ui, config, storage_dir, &name, &updated)?;
+    let became_active = maybe_set_active(ui, config, storage_dir, &name, &updated)?;
     ui.wait_for_key("Press any key to continue...")?;
-    Ok(())
+    if became_active {
+        Ok(Some(identity))
+    } else {
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -329,16 +352,19 @@ fn prompt_unique_name(ui: &Ui, entries: &[IdentityEntry], prompt: &str) -> Resul
     }
 }
 
-/// Save a freshly generated identity, update the index, offer to set active.
+/// Save a freshly generated identity, update the index, auto-set as active.
+///
+/// Returns the identity so the startup gate can proceed without re-prompting
+/// for the passphrase.
 fn persist_identity(
     ui:          &Ui,
     config:      &mut AppConfig,
     storage_dir: &Path,
     name:        &str,
     nickname:    &str,
-    identity:    &PgpIdentity,
+    identity:    PgpIdentity,
     existing:    &[IdentityEntry],
-) -> Result<()> {
+) -> Result<Option<PgpIdentity>> {
     let armored_sk = identity.secret_key_armored()
         .map_err(|e| anyhow::anyhow!("Failed to export key: {e}"))?;
 
@@ -361,20 +387,25 @@ fn persist_identity(
     ui.info("Fingerprint", &identity.fingerprint())?;
     ui.info("Key file",    &key_path.display().to_string())?;
 
-    maybe_set_active(ui, config, storage_dir, name, &updated)?;
+    // New identities are always set as active automatically.
+    config.active_identity = Some(name.to_owned());
+    persistence::save_config(storage_dir, config)
+        .with_context(|| "Failed to save config")?;
+    ui.success(&format!("'{}' is now the active identity.", name))?;
     ui.wait_for_key("Press any key to continue...")?;
-    Ok(())
+    Ok(Some(identity))
 }
 
 /// If no active identity is set, set this one automatically.
 /// Otherwise, offer the user the choice.
+/// Returns `true` when the identity was set as active.
 fn maybe_set_active(
     ui:          &Ui,
     config:      &mut AppConfig,
     storage_dir: &Path,
     name:        &str,
-    entries:     &[IdentityEntry],
-) -> Result<()> {
+    _entries:    &[IdentityEntry],
+) -> Result<bool> {
     let should_set = if config.active_identity.is_none() {
         true
     } else {
@@ -388,6 +419,5 @@ fn maybe_set_active(
             .with_context(|| "Failed to save config")?;
         ui.success(&format!("'{}' is now the active identity.", name))?;
     }
-    let _ = entries; // suppress unused-var warning
-    Ok(())
+    Ok(should_set)
 }

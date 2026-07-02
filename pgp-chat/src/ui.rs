@@ -9,7 +9,7 @@ use crossterm::{
     terminal::{Clear, ClearType},
 };
 use pgp_chat_core::{
-    persistence::AppConfig,
+    persistence::{AppConfig, ChatTheme},
     terminal::{capability::TerminalCapability, renderer::Renderer},
 };
 use std::io::{self, stdout, Write};
@@ -51,6 +51,13 @@ impl Ui {
         let mut cap = TerminalCapability::detect();
         cap.width = width;
         Self { renderer: Renderer::with_theme(cap, &config.chat_theme) }
+    }
+
+    /// Build a `Ui` from an explicit theme + width (used after identity prefs are loaded).
+    pub fn from_theme_at_width(theme: &ChatTheme, width: u16) -> Self {
+        let mut cap = TerminalCapability::detect();
+        cap.width = width;
+        Self { renderer: Renderer::with_theme(cap, theme) }
     }
 
     // -----------------------------------------------------------------------

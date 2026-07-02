@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use pgp_chat_core::{
     crypto::identity::PgpIdentity,
-    persistence::{self, AppConfig, PersistedRoom, passphrase_is_encrypted},
+    persistence::{self, AppConfig, PersistedRoom},
 };
 use std::io::{stdout, Write};
 use std::path::Path;
@@ -13,21 +13,37 @@ use crate::ui::Ui;
 // Public entry point
 // ---------------------------------------------------------------------------
 
-pub fn run(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<()> {
+pub fn run(ui: &Ui, storage_dir: &Path, config: &AppConfig, identity: &PgpIdentity) -> Result<()> {
+    let identity_name = config.active_identity.as_deref().unwrap_or("");
     loop {
-        let rooms = persistence::load_rooms(storage_dir, None);
+        // Phase 1: draw full skeleton immediately so the screen looks complete
+        // while the PGP file-envelope decrypt runs in phase 2.
+        ui.clear()?;
+        ui.renderer.draw_box_top("Manage Rooms")?;
+        ui.renderer.draw_box_separator()?;
+        println!("  [c] Create Room   (set or generate a passphrase — you become the owner)\r");
+        println!("  [0] Back\r");
+        ui.renderer.draw_box_bottom()?;
+        stdout().flush()?;
 
+        // Phase 2: decrypt + load (one S2K for the file envelope).
+        let rooms = persistence::load_rooms(storage_dir, identity_name, identity);
+
+        // Phase 3: redraw with real room list.
         ui.clear()?;
         ui.renderer.draw_box_top("Manage Rooms")?;
 
         if rooms.is_empty() {
-            println!("  No rooms saved yet.  Use [c] to add one.\r");
+            println!("  No rooms saved yet.  Use [c] to create one.\r");
+            println!("  To join a friend's room, find them in Scan for Peers or Contacts & Trust.\r");
         } else {
-            println!("  {:<3}  {:<26}  {}\r", "#", "Room Name", "Role");
+            // "  [NN]  " (7) + "  " (2) + "member" (6) = 15 chars fixed; clamp name column
+            let name_w = (ui.renderer.cap().width as usize).saturating_sub(15).clamp(10, 32);
+            println!("  {:<3}  {:<name_w$}  {}\r", "#", "Room Name", "Role");
             ui.renderer.draw_box_separator()?;
             for (i, r) in rooms.iter().enumerate() {
                 let role = if r.is_owner { "owner" } else { "member" };
-                println!("  [{:<2}]  {:<26}  {}\r", i + 1, r.name, role);
+                println!("  [{:<2}]  {:<name_w$}  {}\r", i + 1, r.name, role);
             }
             println!("\r");
             println!("  Enter a number to view / edit details\r");
@@ -35,27 +51,25 @@ pub fn run(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<()> {
 
         ui.renderer.draw_box_separator()?;
         println!("  [c] Create Room   (set or generate a passphrase — you become the owner)\r");
-        println!("  [j] Join Room     (enter a passphrase someone shared with you)\r");
         if !rooms.is_empty() {
             println!("  [f] Forget a room\r");
         }
         println!("  [0] Back\r");
         ui.renderer.draw_box_bottom()?;
         stdout().flush()?;
-        crate::sidebar::draw_auto(storage_dir, ui);
+        crate::sidebar::draw_auto(storage_dir, ui, Some(identity));
 
         let choice = ui.prompt("Choice:")?;
         let choice = choice.trim().to_lowercase();
 
         match choice.as_str() {
             "0" | "" => return Ok(()),
-            "c"      => create_room(ui, storage_dir, config, &rooms)?,
-            "j"      => join_room(ui, storage_dir, config, &rooms)?,
-            "f" if !rooms.is_empty() => forget_room(ui, storage_dir, &rooms)?,
+            "c"      => create_room(ui, storage_dir, identity_name, identity, &rooms)?,
+            "f" if !rooms.is_empty() => forget_room(ui, storage_dir, identity_name, identity, &rooms)?,
             _ => {
                 if let Ok(idx) = choice.parse::<usize>() {
                     if idx >= 1 && idx <= rooms.len() {
-                        room_detail(ui, storage_dir, config, idx - 1)?;
+                        room_detail(ui, storage_dir, config, identity_name, idx - 1, identity)?;
                     } else {
                         ui.error("Invalid number.")?;
                         ui.wait_for_key("Press any key...")?;
@@ -73,7 +87,13 @@ pub fn run(ui: &Ui, storage_dir: &Path, config: &AppConfig) -> Result<()> {
 // Create a new room (owner sets or generates the passphrase)
 // ---------------------------------------------------------------------------
 
-fn create_room(ui: &Ui, storage_dir: &Path, config: &AppConfig, existing: &[PersistedRoom]) -> Result<()> {
+fn create_room(
+    ui:            &Ui,
+    storage_dir:   &Path,
+    identity_name: &str,
+    identity:      &PgpIdentity,
+    existing:      &[PersistedRoom],
+) -> Result<()> {
     ui.renderer.draw_box_top("Create Room")?;
     println!("  You can choose your own passphrase or let the app generate one.\r");
     println!("  Share it out-of-band with peers before they try to join.\r");
@@ -98,51 +118,12 @@ fn create_room(ui: &Ui, storage_dir: &Path, config: &AppConfig, existing: &[Pers
     ui.show_passphrase_box("Room Passphrase — share this with your peers", &passphrase);
     println!("  Anyone without this passphrase cannot read room traffic.\r");
 
-    let identity = try_load_identity(ui, config, "encrypt room passphrase");
-
-    let mut rooms = persistence::load_rooms(storage_dir, None);
+    let mut rooms = persistence::load_rooms(storage_dir, identity_name, identity);
     rooms.push(PersistedRoom { name: name.clone(), passphrase, is_owner: true });
-    persistence::save_rooms(storage_dir, &rooms, identity.as_ref())
+    persistence::save_rooms(storage_dir, identity_name, &rooms, identity)
         .with_context(|| "Failed to save rooms")?;
 
     ui.success(&format!("Room '{}' created — you are the owner.", name))?;
-    ui.wait_for_key("Press any key to continue...")?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Join an existing room (member enters the owner's passphrase)
-// ---------------------------------------------------------------------------
-
-fn join_room(ui: &Ui, storage_dir: &Path, config: &AppConfig, existing: &[PersistedRoom]) -> Result<()> {
-    ui.renderer.draw_box_top("Join Room")?;
-    println!("  Enter the room name and passphrase that the room owner shared with you.\r");
-    println!("\r");
-
-    let name = prompt_unique_room_name(ui, existing)?;
-    if name.is_empty() {
-        return Ok(());
-    }
-
-    let input = ui.prompt_password("Room passphrase:")?;
-    if input.is_empty() {
-        ui.error("A passphrase is required to join a room. Use [c] to create a new room instead.")?;
-        ui.wait_for_key("Press any key...")?;
-        return Ok(());
-    }
-
-    let identity = try_load_identity(ui, config, "encrypt room passphrase");
-
-    let mut rooms = persistence::load_rooms(storage_dir, None);
-    rooms.push(PersistedRoom {
-        name:       name.clone(),
-        passphrase: input.as_str().to_owned(),
-        is_owner:   false,
-    });
-    persistence::save_rooms(storage_dir, &rooms, identity.as_ref())
-        .with_context(|| "Failed to save rooms")?;
-
-    ui.success(&format!("Room '{}' saved — you are a member.", name))?;
     ui.wait_for_key("Press any key to continue...")?;
     Ok(())
 }
@@ -171,24 +152,25 @@ fn prompt_unique_room_name(ui: &Ui, existing: &[PersistedRoom]) -> Result<String
 // Room detail / edit
 // ---------------------------------------------------------------------------
 
-fn room_detail(ui: &Ui, storage_dir: &Path, config: &AppConfig, idx: usize) -> Result<()> {
+fn room_detail(
+    ui:            &Ui,
+    storage_dir:   &Path,
+    config:        &AppConfig,
+    identity_name: &str,
+    idx:           usize,
+    identity:      &PgpIdentity,
+) -> Result<()> {
     loop {
-        let rooms = persistence::load_rooms(storage_dir, None);
+        ui.clear()?;
+        ui.renderer.draw_box_top("Room Details")?;
+        let rooms = persistence::load_rooms(storage_dir, identity_name, identity);
         if idx >= rooms.len() {
             return Ok(());
         }
         let r = &rooms[idx];
-
-        ui.clear()?;
-        ui.renderer.draw_box_top("Room Details")?;
         ui.info("Name",       &r.name)?;
         ui.info("Role",       if r.is_owner { "owner" } else { "member" })?;
-        let pass_display = if passphrase_is_encrypted(&r.passphrase) {
-            "[encrypted — view in chat]".to_string()
-        } else {
-            "*".repeat(r.passphrase.len().min(32))
-        };
-        ui.info("Passphrase", &pass_display)?;
+        ui.info("Passphrase", "* * * * * * * *")?;
         ui.renderer.draw_box_separator()?;
         println!("  [s] Show passphrase\r");
         println!("  [n] Rename room\r");
@@ -196,14 +178,14 @@ fn room_detail(ui: &Ui, storage_dir: &Path, config: &AppConfig, idx: usize) -> R
         println!("  [0] Back\r");
         ui.renderer.draw_box_bottom()?;
         stdout().flush()?;
-        crate::sidebar::draw_auto(storage_dir, ui);
+        crate::sidebar::draw_auto(storage_dir, ui, Some(identity));
 
         let choice = ui.prompt("Choice:")?;
         match choice.trim().to_lowercase().as_str() {
             "0" | "" => return Ok(()),
-            "s"      => show_passphrase(ui, storage_dir, config, idx)?,
-            "n"      => { rename_room(ui, storage_dir, idx)?; }
-            "p"      => { update_passphrase(ui, storage_dir, config, idx)?; }
+            "s"      => show_passphrase(ui, storage_dir, identity_name, identity, idx)?,
+            "n"      => { rename_room(ui, storage_dir, identity_name, identity, idx)?; }
+            "p"      => { update_passphrase(ui, storage_dir, config, identity_name, identity, idx)?; }
             _        => {
                 ui.error("Unknown choice.")?;
                 ui.wait_for_key("Press any key...")?;
@@ -212,35 +194,35 @@ fn room_detail(ui: &Ui, storage_dir: &Path, config: &AppConfig, idx: usize) -> R
     }
 }
 
-fn show_passphrase(ui: &Ui, storage_dir: &Path, config: &AppConfig, idx: usize) -> Result<()> {
-    let rooms = persistence::load_rooms(storage_dir, None);
+fn show_passphrase(
+    ui:            &Ui,
+    storage_dir:   &Path,
+    identity_name: &str,
+    identity:      &PgpIdentity,
+    idx:           usize,
+) -> Result<()> {
+    let rooms = persistence::load_rooms(storage_dir, identity_name, identity);
     if idx >= rooms.len() {
         return Ok(());
     }
     let r = &rooms[idx];
-
-    let plaintext = if passphrase_is_encrypted(&r.passphrase) {
-        let identity = match try_load_identity(ui, config, "view room passphrase") {
-            Some(id) => id,
-            None => {
-                ui.wait_for_key("Press any key to continue...")?;
-                return Ok(());
-            }
-        };
-        persistence::decrypt_room_passphrase(&r.passphrase, &identity)
-    } else {
-        r.passphrase.clone()
-    };
+    let plain_pass = persistence::decrypt_room_passphrase(&r.passphrase, identity);
 
     println!("\r");
-    ui.show_passphrase_box(&format!("Passphrase for '{}'", r.name), &plaintext);
+    ui.show_passphrase_box(&format!("Passphrase for '{}'", r.name), &plain_pass);
     println!("  Share this out-of-band with peers who need to join the room.\r");
     ui.wait_for_key("Press any key to continue...")?;
     Ok(())
 }
 
-fn rename_room(ui: &Ui, storage_dir: &Path, idx: usize) -> Result<()> {
-    let mut rooms = persistence::load_rooms(storage_dir, None);
+fn rename_room(
+    ui:            &Ui,
+    storage_dir:   &Path,
+    identity_name: &str,
+    identity:      &PgpIdentity,
+    idx:           usize,
+) -> Result<()> {
+    let mut rooms = persistence::load_rooms(storage_dir, identity_name, identity);
     if idx >= rooms.len() {
         return Ok(());
     }
@@ -260,15 +242,22 @@ fn rename_room(ui: &Ui, storage_dir: &Path, idx: usize) -> Result<()> {
     }
 
     rooms[idx].name = new_name.clone();
-    persistence::save_rooms(storage_dir, &rooms, None)
+    persistence::save_rooms(storage_dir, identity_name, &rooms, identity)
         .with_context(|| "Failed to save rooms")?;
     ui.success(&format!("Room renamed from '{}' to '{}'.", old_name, new_name))?;
     ui.wait_for_key("Press any key...")?;
     Ok(())
 }
 
-fn update_passphrase(ui: &Ui, storage_dir: &Path, config: &AppConfig, idx: usize) -> Result<()> {
-    let mut rooms = persistence::load_rooms(storage_dir, None);
+fn update_passphrase(
+    ui:            &Ui,
+    storage_dir:   &Path,
+    _config:       &AppConfig,
+    identity_name: &str,
+    identity:      &PgpIdentity,
+    idx:           usize,
+) -> Result<()> {
+    let mut rooms = persistence::load_rooms(storage_dir, identity_name, identity);
     if idx >= rooms.len() {
         return Ok(());
     }
@@ -291,11 +280,9 @@ fn update_passphrase(ui: &Ui, storage_dir: &Path, config: &AppConfig, idx: usize
         (input.as_str().to_owned(), false)
     };
 
-    let identity = try_load_identity(ui, config, "encrypt room passphrase");
-
     rooms[idx].passphrase = passphrase;
     rooms[idx].is_owner   = is_owner;
-    persistence::save_rooms(storage_dir, &rooms, identity.as_ref())
+    persistence::save_rooms(storage_dir, identity_name, &rooms, identity)
         .with_context(|| "Failed to save rooms")?;
     let role = if is_owner { "owner" } else { "member" };
     ui.success(&format!("Passphrase updated for '{}' ({}).", room_name, role))?;
@@ -307,7 +294,13 @@ fn update_passphrase(ui: &Ui, storage_dir: &Path, config: &AppConfig, idx: usize
 // Forget a room
 // ---------------------------------------------------------------------------
 
-fn forget_room(ui: &Ui, storage_dir: &Path, rooms: &[PersistedRoom]) -> Result<()> {
+fn forget_room(
+    ui:            &Ui,
+    storage_dir:   &Path,
+    identity_name: &str,
+    identity:      &PgpIdentity,
+    rooms:         &[PersistedRoom],
+) -> Result<()> {
     ui.renderer.draw_box_top("Forget Room")?;
     for (i, r) in rooms.iter().enumerate() {
         let role = if r.is_owner { "owner" } else { "member" };
@@ -335,25 +328,13 @@ fn forget_room(ui: &Ui, storage_dir: &Path, rooms: &[PersistedRoom]) -> Result<(
 
     if room.is_owner {
         println!("\r");
-        if passphrase_is_encrypted(&room.passphrase) {
-            // Passphrase is PGP-encrypted — we can't compare without identity.
-            // Use a typed-confirmation instead.
-            println!("  You are the owner of '{}'.\r", room.name);
-            let confirm = ui.prompt("Type 'yes' to confirm removing this room:")?;
-            if !confirm.trim().eq_ignore_ascii_case("yes") {
-                println!("  Cancelled.\r");
-                ui.wait_for_key("Press any key...")?;
-                return Ok(());
-            }
-        } else {
-            // Plaintext passphrase — compare directly as before.
-            println!("  You are the owner of '{}'.  Confirm with your room passphrase.\r", room.name);
-            let entered = ui.prompt_password("Room passphrase:")?;
-            if entered.as_str() != room.passphrase {
-                ui.error("Incorrect passphrase — cancelled.")?;
-                ui.wait_for_key("Press any key...")?;
-                return Ok(());
-            }
+        println!("  You are the owner of '{}'.  Confirm with your room passphrase.\r", room.name);
+        let entered = ui.prompt_password("Room passphrase:")?;
+        let plain_pass = persistence::decrypt_room_passphrase(&room.passphrase, identity);
+        if entered.as_str() != plain_pass {
+            ui.error("Incorrect passphrase — cancelled.")?;
+            ui.wait_for_key("Press any key...")?;
+            return Ok(());
         }
     } else {
         let confirm = ui.prompt(&format!(
@@ -367,46 +348,12 @@ fn forget_room(ui: &Ui, storage_dir: &Path, rooms: &[PersistedRoom]) -> Result<(
     }
 
     let room_name = room.name.clone();
-    let mut updated = persistence::load_rooms(storage_dir, None);
+    let mut updated = persistence::load_rooms(storage_dir, identity_name, identity);
     updated.retain(|r| r.name != room_name);
-    persistence::save_rooms(storage_dir, &updated, None)
+    persistence::save_rooms(storage_dir, identity_name, &updated, identity)
         .with_context(|| "Failed to save rooms")?;
 
     ui.success(&format!("Room '{}' removed from your list.", room_name))?;
     ui.wait_for_key("Press any key...")?;
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Identity helper — load identity to encrypt room passphrases
-// ---------------------------------------------------------------------------
-
-/// Load the active PGP identity interactively.
-///
-/// `action` is shown in the prompt (e.g. `"encrypt room passphrase"` or
-/// `"view room passphrase"`).  Returns `None` if no identity is configured,
-/// the user presses Enter to cancel, or the passphrase is wrong.
-fn try_load_identity(ui: &Ui, config: &AppConfig, action: &str) -> Option<PgpIdentity> {
-    let name = config.active_identity.as_ref()?;
-    let entries = persistence::load_identity_entries(&config.identities_dir);
-    let entry   = entries.into_iter().find(|e| &e.name == name)?;
-    let armored = persistence::load_named_identity(&config.identities_dir, &entry.name)
-        .ok()??;
-
-    println!("\r");
-    println!("  PGP key passphrase required to {}.\r", action);
-    let passphrase = ui.prompt_password(&format!(
-        "Key passphrase for '{}' [Enter to cancel]:", entry.nickname
-    )).ok()?;
-    if passphrase.is_empty() {
-        return None;
-    }
-
-    match PgpIdentity::from_armored_secret_key(&entry.nickname, &armored, passphrase) {
-        Ok(id) => Some(id),
-        Err(_) => {
-            let _ = ui.error("Incorrect PGP passphrase.");
-            None
-        }
-    }
 }

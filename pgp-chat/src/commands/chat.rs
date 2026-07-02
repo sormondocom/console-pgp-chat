@@ -72,7 +72,7 @@ pub async fn run(
     ui:          &Ui,
     storage_dir: &Path,
     config:      &AppConfig,
-    direct:      Option<(PersistedRoom, Option<libp2p::Multiaddr>)>,
+    direct:      Option<(PersistedRoom, Option<libp2p::Multiaddr>, Option<u16>)>,
     identity:    &PgpIdentity,
 ) -> Result<()> {
     // Apply the active theme's system-message color for this session.
@@ -85,7 +85,7 @@ pub async fn run(
 
     // ── Load persisted contacts ────────────────────────────────────────────
     let identity_name = config.active_identity.as_deref().unwrap_or("");
-    let persisted_contacts = persistence::load_contacts(&storage_dir, identity_name);
+    let persisted_contacts = persistence::load_contacts(&storage_dir, identity_name, &pgp_identity);
     let (initial_keystore, loaded_count, failed_count) = build_keystore(&persisted_contacts);
 
     if loaded_count > 0 {
@@ -100,33 +100,36 @@ pub async fn run(
     }
 
     // ── Load known rooms ───────────────────────────────────────────────────
-    let mut known_rooms: Vec<PersistedRoom> = persistence::load_rooms(&storage_dir, Some(&pgp_identity));
-    // Re-save immediately so any rooms created before an identity was loaded
-    // (e.g. from room_manager when no identity was entered) get encrypted now.
-    let _ = persistence::save_rooms(&storage_dir, &known_rooms, Some(&pgp_identity));
+    let mut known_rooms: Vec<PersistedRoom> = persistence::load_rooms(&storage_dir, identity_name, &pgp_identity);
+    let _ = persistence::save_rooms(&storage_dir, identity_name, &known_rooms, &pgp_identity);
 
-    // ── One-time network config ────────────────────────────────────────────
-    let port_str = ui.prompt("Listen port [0 = random]:")?;
-    let port: u16 = port_str.trim().parse().unwrap_or(0);
-
-    // ── Room + bootstrap — interactive prompts or pre-selected from scanner ─
-    let (initial_room, initial_passphrase, initial_is_owner, bootstrap_addr) =
-        if let Some((room, bootstrap)) = direct {
-            // Peer scanner handed us the room and the peer's address.
+    // ── Room + bootstrap — interactive prompts or pre-selected from Friends/scanner ─
+    let (initial_room, initial_passphrase, initial_is_owner, bootstrap_addr, port) =
+        if let Some((room, bootstrap, port_pref)) = direct {
+            // Friends or peer scanner handed us the room and optionally the port.
             println!("  Room: {}  [{}]\r",
                 room.name,
                 if room.is_owner { "owner" } else { "member" });
             if let Some(ref addr) = bootstrap {
-                println!("  Bootstrap: {} (from peer scanner)\r", addr);
+                println!("  Bootstrap: {}\r", addr);
             }
+            let port = if let Some(p) = port_pref {
+                p
+            } else {
+                let port_str = ui.prompt("Listen port [0 = random]:")?;
+                port_str.trim().parse().unwrap_or(0)
+            };
             (
                 room.name.clone(),
                 Zeroizing::new(persistence::decrypt_room_passphrase(&room.passphrase, &pgp_identity)),
                 room.is_owner,
                 bootstrap,
+                port,
             )
         } else {
-            // Normal menu flow: interactive room selection then bootstrap prompt.
+            // Normal interactive flow: port → room selection → bootstrap.
+            let port_str = ui.prompt("Listen port [0 = random]:")?;
+            let port: u16 = port_str.trim().parse().unwrap_or(0);
             let (room_name, pass, is_owner) =
                 match select_room_at_startup(ui, &known_rooms)? {
                     Some(r) => r,
@@ -141,7 +144,7 @@ pub async fn run(
                     Err(_) => { ui.error("Invalid multiaddr — skipping bootstrap")?; None }
                 }
             };
-            (room_name, pass, is_owner, addr)
+            (room_name, pass, is_owner, addr, port)
         };
 
     // ── Room-switching outer loop ──────────────────────────────────────────
@@ -158,7 +161,7 @@ pub async fn run(
                 passphrase: current_pass.as_str().to_owned(),
                 is_owner:   current_is_owner,
             });
-            let _ = persistence::save_rooms(&storage_dir, &known_rooms, Some(&pgp_identity));
+            let _ = persistence::save_rooms(&storage_dir, identity_name, &known_rooms, &pgp_identity);
         }
 
         // ── Build a fresh swarm for this session ───────────────────────────
@@ -398,6 +401,8 @@ pub async fn run(
                             let safe_nick = crate::ui::sanitize_display(&sender_nick);
                             let safe_filename = crate::ui::sanitize_display(&filename);
                             let safe_desc = crate::ui::sanitize_display(&description);
+                            let contacts = persistence::load_contacts(&storage_dir, identity_name, &pgp_identity);
+                            let sender_trusted = contacts.contacts.iter().any(|c| c.fingerprint == sender_fp);
                             print_system("── Incoming File Transfer ─────────────────────")?;
                             print_system(&format!("  From:        {} ({})", safe_nick, sender_fp))?;
                             print_system(&format!("  File:        {}", safe_filename))?;
@@ -408,7 +413,12 @@ pub async fn run(
                             if !sender_addrs.is_empty() {
                                 print_system(&format!("  Network:     {}", sender_addrs.join(", ")))?;
                             }
-                            print_system("  Type /accept to accept (prompts for save path), /decline to reject.")?;
+                            if !sender_trusted {
+                                print_system("  [!] Sender is not in your contacts — file transfers require mutual trust.")?;
+                                print_system("      Use /decline to reject, or /trust to establish trust first.")?;
+                            } else {
+                                print_system("  Type /accept to accept (prompts for save path), /decline to reject.")?;
+                            }
                             print_system("──────────────────────────────────────────────")?;
                             last_offer = Some((transfer_id, safe_filename));
                         }
@@ -596,7 +606,7 @@ pub async fn run(
                                                                     passphrase: pass.as_str().to_owned(),
                                                                     is_owner,
                                                                 });
-                                                                let _ = persistence::save_rooms(&storage_dir, &known_rooms, Some(&pgp_identity));
+                                                                let _ = persistence::save_rooms(&storage_dir, identity_name, &known_rooms, &pgp_identity);
                                                             }
                                                             print_system(&format!("Leaving {}...", current_room))?;
                                                             pending_switch = Some((name, pass, is_owner));
@@ -604,11 +614,11 @@ pub async fn run(
                                                         }
                                                         RoomAction::Deleted(name) => {
                                                             print_system(&format!("Room '{}' deleted.", name))?;
-                                                            let _ = persistence::save_rooms(&storage_dir, &known_rooms, Some(&pgp_identity));
+                                                            let _ = persistence::save_rooms(&storage_dir, identity_name, &known_rooms, &pgp_identity);
                                                         }
                                                         RoomAction::Left(name) => {
                                                             print_system(&format!("Left room '{}'.", name))?;
-                                                            let _ = persistence::save_rooms(&storage_dir, &known_rooms, Some(&pgp_identity));
+                                                            let _ = persistence::save_rooms(&storage_dir, identity_name, &known_rooms, &pgp_identity);
                                                         }
                                                         RoomAction::Cancel => {}
                                                     }
@@ -647,7 +657,7 @@ pub async fn run(
                                                                     passphrase: pass.as_str().to_owned(),
                                                                     is_owner,
                                                                 });
-                                                                let _ = persistence::save_rooms(&storage_dir, &known_rooms, Some(&pgp_identity));
+                                                                let _ = persistence::save_rooms(&storage_dir, identity_name, &known_rooms, &pgp_identity);
                                                                 print_system(&format!("Leaving {}...", current_room))?;
                                                                 pending_switch = Some((name, pass, is_owner));
                                                                 let _ = handle.cmd_tx.send(RoomCommand::Disconnect).await;
@@ -764,17 +774,28 @@ pub async fn run(
                                                 if recipient_fp.is_empty() {
                                                     print_system("Cancelled.")?;
                                                 } else {
-                                                    let path = ui.prompt("File path:")?;
-                                                    let path = path.trim().to_string();
-                                                    if path.is_empty() {
-                                                        print_system("Cancelled.")?;
+                                                    let contacts = persistence::load_contacts(&storage_dir, identity_name, &pgp_identity);
+                                                    let is_trusted = contacts.contacts.iter()
+                                                        .any(|c| c.fingerprint == recipient_fp);
+                                                    if !is_trusted {
+                                                        print_system(&format!(
+                                                            "File transfers require mutual trust — {} is not in your contacts.",
+                                                            &recipient_fp[..recipient_fp.len().min(16)]
+                                                        ))?;
+                                                        print_system("Use /trust or the Trust Manager to establish trust first.")?;
                                                     } else {
-                                                        let desc = ui.prompt("Description (optional):")?;
-                                                        let _ = handle.cmd_tx.send(RoomCommand::SendFile {
-                                                            recipient_fp,
-                                                            path,
-                                                            description: desc.trim().to_string(),
-                                                        }).await;
+                                                        let path = ui.prompt("File path:")?;
+                                                        let path = path.trim().to_string();
+                                                        if path.is_empty() {
+                                                            print_system("Cancelled.")?;
+                                                        } else {
+                                                            let desc = ui.prompt("Description (optional):")?;
+                                                            let _ = handle.cmd_tx.send(RoomCommand::SendFile {
+                                                                recipient_fp,
+                                                                path,
+                                                                description: desc.trim().to_string(),
+                                                            }).await;
+                                                        }
                                                     }
                                                 }
                                             }
@@ -872,12 +893,11 @@ pub async fn run(
         }
 
         if let Some(ref snapshot) = trust_snapshot {
-            match persistence::save_contacts(&storage_dir, identity_name, snapshot) {
+            match persistence::save_contacts(&storage_dir, identity_name, snapshot, &pgp_identity) {
                 Ok(()) => {
                     print_system(&format!(
-                        "[+] Saved {} trusted contact(s) to: {}",
+                        "[+] Saved {} trusted contact(s) to contacts file",
                         snapshot.contacts.len(),
-                        persistence::contacts_path(&storage_dir, identity_name).display()
                     ))?;
                 }
                 Err(e) => {
@@ -926,12 +946,11 @@ fn select_room_at_startup(
     known_rooms: &[PersistedRoom],
 ) -> Result<Option<(String, Zeroizing<String>, bool)>> {
     if known_rooms.is_empty() {
-        // No rooms saved yet — prompt to create or join one.
         println!("\r");
-        println!("  No rooms saved yet.  Add them via [3] Manage Rooms, or set one up now:\r");
+        println!("  No rooms saved yet.\r");
+        println!("  To join a friend's room, find them via Scan for Peers or Contacts & Trust.\r");
         println!("\r");
         print_system("  [c] Create room  (generates a passphrase — you become the owner)")?;
-        print_system("  [j] Join room    (enter a passphrase the room owner shared with you)")?;
         print_system("  [0] Back to menu")?;
         let action = ui.prompt("Choice:")?;
         return match action.trim().to_lowercase().as_str() {
@@ -941,17 +960,6 @@ fn select_room_at_startup(
                 if name.is_empty() { return Ok(None); }
                 let (pass, is_owner) = generate_room_passphrase(ui, &name)?;
                 Ok(Some((name, pass, is_owner)))
-            }
-            "j" => {
-                let room_input = ui.prompt("Room name:")?;
-                let name = room_input.trim().to_string();
-                if name.is_empty() { return Ok(None); }
-                let pass = ui.prompt_password("Room passphrase:")?;
-                if pass.is_empty() {
-                    print_system("A passphrase is required to join a room.")?;
-                    return Ok(None);
-                }
-                Ok(Some((name, pass, false)))
             }
             _ => Ok(None),
         };
@@ -965,7 +973,6 @@ fn select_room_at_startup(
             print_system(&format!("  [{}] {}  ({})", i + 1, r.name, role))?;
         }
         print_system("  [c] Create a new room")?;
-        print_system("  [j] Join an existing room")?;
         print_system("─────────────────────────────────────────────────────────")?;
 
         let choice = ui.prompt("Choice:")?;
@@ -984,32 +991,6 @@ fn select_room_at_startup(
             }
             let (pass, is_owner) = generate_room_passphrase(ui, &name)?;
             return Ok(Some((name, pass, is_owner)));
-        }
-
-        if choice.eq_ignore_ascii_case("j") {
-            let room_input = ui.prompt("Room name:")?;
-            let name = room_input.trim().to_string();
-            if name.is_empty() {
-                print_system("No name entered — try again.")?;
-                continue;
-            }
-            // If already saved, require stored passphrase (re-entering a known room).
-            if let Some(r) = known_rooms.iter().find(|r| r.name == name) {
-                let stored   = r.passphrase.clone();
-                let is_owner = r.is_owner;
-                let entered  = ui.prompt_password("Room passphrase:")?;
-                if entered.as_str() != stored {
-                    print_system("Incorrect passphrase — try again.")?;
-                    continue;
-                }
-                return Ok(Some((name, Zeroizing::new(stored), is_owner)));
-            }
-            let pass = ui.prompt_password("Room passphrase (from room owner):")?;
-            if pass.is_empty() {
-                print_system("A passphrase is required to join a room.")?;
-                continue;
-            }
-            return Ok(Some((name, pass, false)));
         }
 
         if let Ok(idx) = choice.parse::<usize>() {

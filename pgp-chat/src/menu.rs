@@ -1,18 +1,19 @@
-use std::io::{stdout, Write};
+use std::io::Write;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
+use chrono::Utc;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
-    style::{Print, ResetColor, SetForegroundColor, Color},
     terminal,
-    queue,
 };
 use pgp_chat_core::{
     crypto::identity::PgpIdentity,
-    persistence::{self, PersistedRoom},
+    persistence::{
+        self, IdentityPrefs, PendingTrustRequest, PersistedContact, PersistedTrustStore,
+    },
 };
-use zeroize::Zeroizing;
 
 use crate::{background, commands, sidebar, ui::Ui};
 
@@ -22,13 +23,12 @@ use crate::{background, commands, sidebar, ui::Ui};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MenuItem {
-    StartChat,
     ManageIdentities,
     ManageRooms,
     ScanPeers,
     TrustRequests,
+    FriendsView,
     Settings,
-    StartChatWithContact(usize),
     Exit,
 }
 
@@ -39,12 +39,11 @@ struct MenuEntry {
 }
 
 const ENTRIES: &[MenuEntry] = &[
-    MenuEntry { key: '1', label: "Start Chat",        desc: "Connect to a room and exchange encrypted messages" },
-    MenuEntry { key: '2', label: "Manage Identities", desc: "Create, import, switch, or delete PGP identities" },
-    MenuEntry { key: '3', label: "Manage Rooms",      desc: "Create rooms or join rooms shared by others" },
-    MenuEntry { key: '4', label: "Scan for Peers",    desc: "Discover pgp-chat nodes on the network" },
-    MenuEntry { key: '5', label: "Contacts & Trust",  desc: "View trusted contacts and pending trust requests" },
-    MenuEntry { key: '6', label: "Settings",          desc: "Configure file paths and chat color theme" },
+    MenuEntry { key: '1', label: "Manage Identities", desc: "Create, import, switch, or delete PGP identities" },
+    MenuEntry { key: '2', label: "Manage Rooms",      desc: "Create and manage your chat rooms" },
+    MenuEntry { key: '3', label: "Scan for Peers",    desc: "Discover pgp-chat nodes on the network" },
+    MenuEntry { key: '4', label: "Friends",           desc: "View contacts, start chat, handle trust requests" },
+    MenuEntry { key: '5', label: "Settings",          desc: "Configure file paths and chat color theme" },
     MenuEntry { key: 'q', label: "Quit",              desc: "" },
 ];
 
@@ -62,40 +61,48 @@ pub async fn run() -> Result<()> {
     };
 
     let identity_name = config.active_identity.clone().unwrap_or_default();
-    tokio::spawn(background::run(storage_dir.clone(), identity.fingerprint(), identity_name));
+    let mut prefs = persistence::load_identity_prefs(&storage_dir, &identity_name, &identity);
+
+    tokio::spawn(background::run(storage_dir.clone(), identity.clone(), identity_name.clone()));
 
     loop {
         let (term_w, _) = terminal::size().unwrap_or((80, 24));
         let main_w      = sidebar::main_width(term_w);
-        let ui          = Ui::from_config_at_width(&config, main_w);
+        let ui          = Ui::from_theme_at_width(&prefs.chat_theme, main_w);
 
         render_menu(&ui)?;
-        sidebar::draw(&storage_dir, term_w, ui.renderer.cap().unicode)?;
+        sidebar::draw(&storage_dir, term_w, ui.renderer.cap().unicode, &identity)?;
 
-        let selected = wait_for_selection(&storage_dir, &config, term_w, ui.renderer.cap().unicode)?;
+        let selected = wait_for_selection(&storage_dir, &config, &prefs, term_w, ui.renderer.cap().unicode, &identity)?;
         ui.clear()?;
 
         let result = match selected {
-            MenuItem::StartChat => {
-                commands::chat::run(&ui, &storage_dir, &config, None, &identity).await
-            }
             MenuItem::ManageIdentities => {
-                commands::identity_manager::run(&ui, &storage_dir, &mut config)
+                commands::identity_manager::run(&ui, &storage_dir, &mut config, Some(&identity)).map(|_| ())
             }
             MenuItem::ManageRooms => {
-                commands::room_manager::run(&ui, &storage_dir, &config)
+                commands::room_manager::run(&ui, &storage_dir, &config, &identity)
             }
             MenuItem::ScanPeers => {
-                commands::peer_scanner::run(&ui, &storage_dir, &config, &identity).await
+                match commands::peer_scanner::run(&ui, &storage_dir, &config, &identity).await {
+                    Ok(Some((room, bootstrap, port_pref))) => {
+                        commands::chat::run(&ui, &storage_dir, &config, Some((room, bootstrap, port_pref)), &identity).await
+                    }
+                    Ok(None) => Ok(()),
+                    Err(e)   => Err(e),
+                }
             }
-            MenuItem::TrustRequests => {
-                commands::trust_manager::run(&ui, &storage_dir, &config)
+            MenuItem::TrustRequests | MenuItem::FriendsView => {
+                match commands::friends::run(&ui, &storage_dir, &config, &identity).await {
+                    Ok(Some((room, bootstrap, port_pref))) => {
+                        commands::chat::run(&ui, &storage_dir, &config, Some((room, bootstrap, port_pref)), &identity).await
+                    }
+                    Ok(None) => Ok(()),
+                    Err(e)   => Err(e),
+                }
             }
             MenuItem::Settings => {
-                commands::settings::run(&ui, &storage_dir, &mut config)
-            }
-            MenuItem::StartChatWithContact(idx) => {
-                start_chat_with_contact(&ui, &storage_dir, &config, idx, &identity).await
+                commands::settings::run(&ui, &storage_dir, &mut config, &mut prefs, &identity_name, &identity)
             }
             MenuItem::Exit => return Ok(()),
         };
@@ -108,85 +115,11 @@ pub async fn run() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Start-chat-with-contact flow
-// ---------------------------------------------------------------------------
-
-async fn start_chat_with_contact(
-    ui:          &Ui,
-    storage_dir: &std::path::Path,
-    config:      &pgp_chat_core::persistence::AppConfig,
-    contact_idx: usize,
-    identity:    &PgpIdentity,
-) -> Result<()> {
-    let identity_name = config.active_identity.as_deref().unwrap_or("");
-    let store = persistence::load_contacts(storage_dir, identity_name);
-    if contact_idx >= store.contacts.len() {
-        ui.error("Contact no longer exists.")?;
-        return Ok(());
-    }
-    let contact = &store.contacts[contact_idx];
-
-    ui.renderer.draw_box_top("Chat with Contact")?;
-    ui.info("Contact", &contact.nickname)?;
-    ui.info("Fingerprint", &contact.fingerprint[..contact.fingerprint.len().min(32)])?;
-    println!("\r");
-
-    // Suggest a room name based on the contact's nickname
-    let default_name = contact.nickname
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-        .collect::<String>()
-        .to_lowercase();
-    let default_name = if default_name.is_empty() { "chat".to_string() } else { default_name };
-
-    let raw = ui.prompt(&format!("Room name [{}]:", default_name))?;
-    let raw = raw.trim().to_string();
-    let room_name = if raw.is_empty() { default_name } else { raw };
-
-    // Generate a random passphrase; wrap in Zeroizing so it's wiped on drop.
-    let mut bytes = [0u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
-    let passphrase = Zeroizing::new(hex::encode(bytes));
-
-    // Show the passphrase prominently for out-of-band delivery
-    println!("\r");
-    ui.show_passphrase_box(
-        &format!("Room passphrase for '{}' — share with {}", room_name, contact.nickname),
-        &passphrase,
-    );
-    println!("  Share this passphrase with {} before they join.\r", contact.nickname);
-    println!("  Press Enter to open the room...\r");
-    ui.renderer.draw_box_bottom()?;
-    stdout().flush()?;
-
-    // Wait for Enter
-    loop {
-        if let Event::Key(KeyEvent { code: KeyCode::Enter, kind: KeyEventKind::Press, .. }) = event::read()? {
-            break;
-        }
-    }
-
-    let room = PersistedRoom {
-        name:       room_name,
-        passphrase: passphrase.as_str().to_owned(),
-        is_owner:   true,
-    };
-
-    commands::chat::run(ui, storage_dir, config, Some((room, None)), identity).await
-}
-
-// ---------------------------------------------------------------------------
 // Startup identity gate
 // ---------------------------------------------------------------------------
 
-/// Must complete before the main menu is shown.
-///
-/// - No identities: opens Identity Manager; returns `None` if the user quits
-///   without creating one.
-/// - Active identity exists: prompts for passphrase and unlocks it.
-/// - Returns `None` if the user cancels (empty passphrase).
 fn startup_identity_gate(
-    storage_dir: &std::path::Path,
+    storage_dir: &Path,
     config:      &mut pgp_chat_core::persistence::AppConfig,
 ) -> Result<Option<PgpIdentity>> {
     loop {
@@ -208,9 +141,10 @@ fn startup_identity_gate(
             ui.renderer.draw_box_bottom()?;
             ui.wait_for_key("Press any key to open Identity Manager...")?;
 
-            commands::identity_manager::run(&ui, storage_dir, config)?;
+            if let Some(new_identity) = commands::identity_manager::run(&ui, storage_dir, config, None)? {
+                return Ok(Some(new_identity));
+            }
 
-            // If the user still hasn't set up an identity, exit.
             let after = persistence::load_identity_entries(&config.identities_dir);
             if after.is_empty() || config.active_identity.is_none() {
                 return Ok(None);
@@ -222,7 +156,6 @@ fn startup_identity_gate(
         let entry = match entries.iter().find(|e| e.name == name) {
             Some(e) => e.clone(),
             None => {
-                // Index is stale — clear the pointer and retry.
                 config.active_identity = None;
                 let _ = persistence::save_config(storage_dir, config);
                 continue;
@@ -236,7 +169,9 @@ fn startup_identity_gate(
                 ui.error(&format!("Key file for identity '{}' is missing.", name))?;
                 println!("  Use Manage Identities to re-import the key or delete the entry.\r");
                 ui.wait_for_key("Press any key to open Identity Manager...")?;
-                commands::identity_manager::run(&ui, storage_dir, config)?;
+                if let Some(new_identity) = commands::identity_manager::run(&ui, storage_dir, config, None)? {
+                    return Ok(Some(new_identity));
+                }
                 continue;
             }
         };
@@ -282,118 +217,203 @@ fn render_menu(ui: &Ui) -> Result<()> {
     }
 
     ui.renderer.draw_box_bottom()?;
-    ui.print_prompt_label("Choice [Tab=contacts]:")?;
+    ui.print_prompt_label("Choice [Tab = Friends view]:")?;
     Ok(())
 }
 
-// Poll with a 500 ms timeout so the sidebar refreshes live while the menu idles.
-// Tab key puts focus into the sidebar contact list; arrows navigate; Enter selects.
-// Terminal resize is handled inline: clear + full redraw at the new dimensions.
+// ---------------------------------------------------------------------------
+// Input loop
+// ---------------------------------------------------------------------------
+
 fn wait_for_selection(
-    storage_dir: &std::path::Path,
+    storage_dir: &Path,
     config:      &pgp_chat_core::persistence::AppConfig,
+    prefs:       &IdentityPrefs,
     term_w:      u16,
     unicode:     bool,
+    identity:    &PgpIdentity,
 ) -> Result<MenuItem> {
-    let mut term_w         = term_w;
-    let mut unicode        = unicode;
-    let mut sidebar_focused = false;
-    let mut sidebar_idx: usize = 0;
+    let id_name = config.active_identity.as_deref().unwrap_or("");
+
+    let mut term_w  = term_w;
+    let mut unicode = unicode;
+
+    let mut trust_alert: Option<PendingTrustRequest> = None;
+    let mut last_pending_count = sidebar::pending_count(storage_dir, identity);
 
     loop {
         if event::poll(Duration::from_millis(500))? {
             match event::read()? {
                 Event::Resize(new_w, _) => {
                     term_w  = new_w;
-                    let main_w  = sidebar::main_width(new_w);
-                    let new_ui  = Ui::from_config_at_width(config, main_w);
-                    unicode = new_ui.renderer.cap().unicode;
+                    let main_w = sidebar::main_width(new_w);
+                    let new_ui = Ui::from_theme_at_width(&prefs.chat_theme, main_w);
+                    unicode    = new_ui.renderer.cap().unicode;
                     new_ui.clear()?;
                     render_menu(&new_ui)?;
-                    let sel = if sidebar_focused { Some(sidebar_idx) } else { None };
-                    let _ = sidebar::draw_with_selection(storage_dir, new_w, unicode, sel);
+                    let _ = sidebar::draw(storage_dir, new_w, unicode, identity);
+                    if let Some(ref alert) = trust_alert {
+                        draw_trust_banner(alert)?;
+                    }
                 }
 
                 Event::Key(KeyEvent { code, kind: KeyEventKind::Press, .. }) => {
-                    if sidebar_focused {
-                        let total  = sidebar::item_count(storage_dir);
-                        let n_pend = sidebar::pending_count(storage_dir);
-                        if total == 0 {
-                            // List emptied while we were focused — drop focus.
-                            sidebar_focused = false;
-                            let _ = sidebar::draw_with_selection(storage_dir, term_w, unicode, None);
-                        } else {
-                            // Clamp in case the list shrank since last navigation.
-                            if sidebar_idx >= total { sidebar_idx = total - 1; }
-                            match code {
-                                KeyCode::Tab | KeyCode::Down => {
-                                    sidebar_idx = (sidebar_idx + 1) % total;
-                                    let _ = sidebar::draw_with_selection(storage_dir, term_w, unicode, Some(sidebar_idx));
-                                }
-                                KeyCode::BackTab | KeyCode::Up => {
-                                    sidebar_idx = if sidebar_idx == 0 {
-                                        total - 1
-                                    } else {
-                                        sidebar_idx - 1
-                                    };
-                                    let _ = sidebar::draw_with_selection(storage_dir, term_w, unicode, Some(sidebar_idx));
-                                }
-                                KeyCode::Enter => {
-                                    if sidebar_idx < n_pend {
-                                        // Enter on a pending trust request → open Contacts & Trust
-                                        return Ok(MenuItem::TrustRequests);
-                                    } else {
-                                        return Ok(MenuItem::StartChatWithContact(sidebar_idx - n_pend));
-                                    }
-                                }
-                                KeyCode::Esc => {
-                                    sidebar_focused = false;
-                                    let _ = sidebar::draw_with_selection(storage_dir, term_w, unicode, None);
-                                }
-                                _ => {}
-                            }
-                        }
-                    } else {
+                    // Trust banner takes priority: T/D/R handle the incoming request.
+                    if trust_alert.is_some() {
                         match code {
-                            KeyCode::Tab => {
-                                let total = sidebar::item_count(storage_dir);
-                                if total > 0 {
-                                    sidebar_focused = true;
-                                    sidebar_idx = 0;
-                                    let _ = sidebar::draw_with_selection(storage_dir, term_w, unicode, Some(0));
-                                    let mut out = stdout();
-                                    let _ = queue!(out,
-                                        SetForegroundColor(Color::DarkGrey),
-                                        Print("  [↑↓ navigate · Enter select · Esc cancel]"),
-                                        ResetColor,
-                                    );
-                                    let _ = out.flush();
+                            KeyCode::Char('t') | KeyCode::Char('T') => {
+                                if let Some(req) = trust_alert.take() {
+                                    menu_accept_trust(storage_dir, identity, id_name, &req);
                                 }
+                                clear_trust_banner()?;
+                                last_pending_count = sidebar::pending_count(storage_dir, identity);
+                                let _ = sidebar::draw(storage_dir, term_w, unicode, identity);
+                                continue;
                             }
-                            KeyCode::Char('1') => return Ok(MenuItem::StartChat),
-                            KeyCode::Char('2') => return Ok(MenuItem::ManageIdentities),
-                            KeyCode::Char('3') => return Ok(MenuItem::ManageRooms),
-                            KeyCode::Char('4') => return Ok(MenuItem::ScanPeers),
-                            KeyCode::Char('5') => return Ok(MenuItem::TrustRequests),
-                            KeyCode::Char('6') => return Ok(MenuItem::Settings),
-                            KeyCode::Char('q') | KeyCode::Esc => return Ok(MenuItem::Exit),
+                            KeyCode::Char('d') | KeyCode::Char('D') => {
+                                trust_alert = None;
+                                clear_trust_banner()?;
+                                continue;
+                            }
+                            KeyCode::Char('r') | KeyCode::Char('R') => {
+                                if let Some(req) = trust_alert.take() {
+                                    menu_reject_trust(storage_dir, identity, id_name, &req);
+                                }
+                                clear_trust_banner()?;
+                                last_pending_count = sidebar::pending_count(storage_dir, identity);
+                                let _ = sidebar::draw(storage_dir, term_w, unicode, identity);
+                                continue;
+                            }
                             _ => {}
                         }
+                    }
+
+                    match code {
+                        KeyCode::Tab => return Ok(MenuItem::FriendsView),
+                        KeyCode::Char('1') => return Ok(MenuItem::ManageIdentities),
+                        KeyCode::Char('2') => return Ok(MenuItem::ManageRooms),
+                        KeyCode::Char('3') => return Ok(MenuItem::ScanPeers),
+                        KeyCode::Char('4') => return Ok(MenuItem::TrustRequests),
+                        KeyCode::Char('5') => return Ok(MenuItem::Settings),
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(MenuItem::Exit),
+                        _ => {}
                     }
                 }
 
                 _ => {}
             }
         } else {
-            // Timeout — refresh the sidebar in case pending count changed.
-            let total = sidebar::item_count(storage_dir);
-            if sidebar_focused && total == 0 {
-                sidebar_focused = false;
-            } else if sidebar_focused && sidebar_idx >= total {
-                sidebar_idx = total.saturating_sub(1);
+            // 500 ms tick — refresh sidebar, surface new trust requests.
+            let current_pending = sidebar::pending_count(storage_dir, identity);
+            if current_pending > last_pending_count && trust_alert.is_none() {
+                let reqs = persistence::load_pending_trust_requests(storage_dir, id_name, identity);
+                if let Some(newest) = reqs.last().cloned() {
+                    trust_alert = Some(newest);
+                    draw_trust_banner(trust_alert.as_ref().unwrap())?;
+                }
             }
-            let sel = if sidebar_focused { Some(sidebar_idx) } else { None };
-            let _ = sidebar::draw_with_selection(storage_dir, term_w, unicode, sel);
+            last_pending_count = current_pending;
+            let _ = sidebar::draw(storage_dir, term_w, unicode, identity);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trust banner — shown at the bottom of the terminal when a new trust request
+// arrives while the user is on the main menu screen.
+// ---------------------------------------------------------------------------
+
+fn draw_trust_banner(req: &PendingTrustRequest) -> Result<()> {
+    use crossterm::{cursor, style::{Color, Print, ResetColor, SetForegroundColor}, terminal};
+    let (_, h) = terminal::size().unwrap_or((80, 24));
+    let fp = &req.from_fingerprint;
+    let fp_short = &fp[..fp.len().min(20)];
+    let mut out = std::io::stdout();
+    crossterm::queue!(out,
+        cursor::SavePosition,
+        cursor::MoveTo(0, h.saturating_sub(3)),
+        terminal::Clear(terminal::ClearType::CurrentLine),
+        SetForegroundColor(Color::Yellow),
+        Print(format!("  ! Trust request from \"{}\"  fp: {}…",
+            crate::ui::sanitize_display(&req.from_nickname), fp_short)),
+        ResetColor,
+        cursor::MoveTo(0, h.saturating_sub(2)),
+        terminal::Clear(terminal::ClearType::CurrentLine),
+        SetForegroundColor(Color::DarkGrey),
+        Print("    [T] Trust   [D] Defer (handle later)   [R] Reject"),
+        ResetColor,
+        cursor::RestorePosition,
+    )?;
+    out.flush()?;
+    Ok(())
+}
+
+fn clear_trust_banner() -> Result<()> {
+    use crossterm::{cursor, terminal};
+    let (_, h) = terminal::size().unwrap_or((80, 24));
+    let mut out = std::io::stdout();
+    crossterm::queue!(out,
+        cursor::SavePosition,
+        cursor::MoveTo(0, h.saturating_sub(3)),
+        terminal::Clear(terminal::ClearType::CurrentLine),
+        cursor::MoveTo(0, h.saturating_sub(2)),
+        terminal::Clear(terminal::ClearType::CurrentLine),
+        cursor::RestorePosition,
+    )?;
+    out.flush()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Trust request accept/reject used by the main menu trust banner
+// ---------------------------------------------------------------------------
+
+fn menu_accept_trust(
+    storage_dir:   &Path,
+    identity:      &PgpIdentity,
+    identity_name: &str,
+    req:           &PendingTrustRequest,
+) {
+    let tmp = PersistedContact {
+        fingerprint:        req.from_fingerprint.clone(),
+        nickname:           req.from_nickname.clone(),
+        armored_public_key: req.from_public_key_armored.clone(),
+        last_seen:          None,
+    };
+    if persistence::parse_contact(&tmp).is_err() {
+        let mut pending = persistence::load_pending_trust_requests(storage_dir, identity_name, identity);
+        pending.retain(|r| r.from_fingerprint != req.from_fingerprint);
+        let _ = persistence::save_pending_trust_requests(storage_dir, identity_name, &pending, identity);
+        return;
+    }
+    let mut store = persistence::load_contacts(storage_dir, identity_name, identity);
+    if !store.contacts.iter().any(|c| c.fingerprint == req.from_fingerprint) {
+        store.contacts.push(PersistedContact {
+            fingerprint:        req.from_fingerprint.clone(),
+            nickname:           req.from_nickname.clone(),
+            armored_public_key: req.from_public_key_armored.clone(),
+            last_seen:          Some(Utc::now()),
+        });
+        let _ = persistence::save_contacts(storage_dir, identity_name, &store, identity);
+    }
+    let mut pending = persistence::load_pending_trust_requests(storage_dir, identity_name, identity);
+    pending.retain(|r| r.from_fingerprint != req.from_fingerprint);
+    let _ = persistence::save_pending_trust_requests(storage_dir, identity_name, &pending, identity);
+}
+
+fn menu_reject_trust(
+    storage_dir:   &Path,
+    identity:      &PgpIdentity,
+    identity_name: &str,
+    req:           &PendingTrustRequest,
+) {
+    let mut pending = persistence::load_pending_trust_requests(storage_dir, identity_name, identity);
+    pending.retain(|r| r.from_fingerprint != req.from_fingerprint);
+    let _ = persistence::save_pending_trust_requests(storage_dir, identity_name, &pending, identity);
+
+    let mut store: PersistedTrustStore = persistence::load_contacts(storage_dir, identity_name, identity);
+    if !store.rejected.contains(&req.from_fingerprint) {
+        store.rejected.push(req.from_fingerprint.clone());
+        let _ = persistence::save_contacts(storage_dir, identity_name, &store, identity);
     }
 }

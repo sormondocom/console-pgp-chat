@@ -1,16 +1,23 @@
-//! Application settings: configure identities directory, downloads directory,
-//! and chat color theme.
-
 use anyhow::{Context, Result};
 use crossterm::{queue, style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor}};
-use pgp_chat_core::persistence::{self, AppConfig, ChatTheme, ThemeColor};
-use pgp_chat_core::terminal::color::tc_to_color;
-use pgp_chat_core::terminal::capability::ColorDepth;
+use pgp_chat_core::{
+    crypto::identity::PgpIdentity,
+    persistence::{self, AppConfig, ChatTheme, IdentityPrefs, ThemeColor},
+    terminal::color::tc_to_color,
+    terminal::capability::ColorDepth,
+};
 use std::io::{stdout, Write};
 use std::path::Path;
 use crate::ui::Ui;
 
-pub fn run(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<()> {
+pub fn run(
+    ui:            &Ui,
+    storage_dir:   &Path,
+    config:        &mut AppConfig,
+    prefs:         &mut IdentityPrefs,
+    identity_name: &str,
+    identity:      &PgpIdentity,
+) -> Result<()> {
     loop {
         ui.clear()?;
         ui.renderer.draw_box_top("Settings")?;
@@ -21,14 +28,14 @@ pub fn run(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<()> {
         println!("  [2] Downloads directory  (default save path for received files)\r");
         println!("      {}\r", config.downloads_dir.display());
         println!("\r");
-        println!("  [3] Chat Theme  (active: {})\r", config.chat_theme.name);
+        println!("  [3] Chat Theme  (active: {})\r", prefs.chat_theme.name);
         println!("\r");
 
         ui.renderer.draw_box_separator()?;
         println!("  [0] Back\r");
         ui.renderer.draw_box_bottom()?;
         stdout().flush()?;
-        crate::sidebar::draw_auto(storage_dir, ui);
+        crate::sidebar::draw_auto(storage_dir, ui, Some(identity));
 
         let choice = ui.prompt("Choice:")?;
         match choice.trim() {
@@ -69,7 +76,7 @@ pub fn run(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<()> {
                 }
             }
 
-            "3" => theme_editor(ui, storage_dir, config)?,
+            "3" => theme_editor(ui, storage_dir, prefs, identity_name, identity)?,
 
             _ => {
                 ui.error("Unknown choice.")?;
@@ -83,18 +90,24 @@ pub fn run(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<()> {
 // Theme editor
 // ---------------------------------------------------------------------------
 
-fn theme_editor(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<()> {
+fn theme_editor(
+    ui:            &Ui,
+    storage_dir:   &Path,
+    prefs:         &mut IdentityPrefs,
+    identity_name: &str,
+    identity:      &PgpIdentity,
+) -> Result<()> {
     let depth = ui.renderer.cap().color_depth;
     loop {
         ui.clear()?;
         ui.renderer.draw_box_top("Chat Theme")?;
 
-        println!("  Active theme: {}\r", config.chat_theme.name);
+        println!("  Active theme: {}\r", prefs.chat_theme.name);
         println!("\r");
         println!("  Enter the number of an element to open its color picker.\r");
         println!("\r");
 
-        let t = &config.chat_theme;
+        let t = &prefs.chat_theme;
         print_theme_row(depth, "  [1] Timestamp ", t.timestamp, false);
         print_theme_row(depth, "  [2] Your ID   ", t.own_id,    false);
         print_theme_row(depth, "  [3] Your Text ", t.own_text,  false);
@@ -106,11 +119,11 @@ fn theme_editor(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<(
 
         println!("\r");
         println!("  Preview:\r");
-        print_preview(depth, &config.chat_theme);
+        print_preview(depth, &prefs.chat_theme);
 
         ui.renderer.draw_box_separator()?;
         println!("  [s] Save theme as…\r");
-        if !config.saved_themes.is_empty() {
+        if !prefs.saved_themes.is_empty() {
             println!("  [l] Load saved theme\r");
             println!("  [x] Delete saved theme\r");
         }
@@ -123,30 +136,30 @@ fn theme_editor(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<(
         match choice.trim() {
             "0" | "" => return Ok(()),
 
-            "1" => pick_and_save(ui, storage_dir, config, depth, "Timestamp color",
-                                 |t| &mut t.timestamp)?,
-            "2" => pick_and_save(ui, storage_dir, config, depth, "Your ID color",
-                                 |t| &mut t.own_id)?,
-            "3" => pick_and_save(ui, storage_dir, config, depth, "Your text color",
-                                 |t| &mut t.own_text)?,
-            "4" => pick_and_save(ui, storage_dir, config, depth, "Peer name color",
-                                 |t| &mut t.peer_id)?,
-            "5" => pick_and_save(ui, storage_dir, config, depth, "Peer text color",
-                                 |t| &mut t.peer_text)?,
-            "6" => pick_and_save(ui, storage_dir, config, depth, "Background color",
-                                 |t| &mut t.background)?,
-            "7" => pick_and_save(ui, storage_dir, config, depth, "Border color",
-                                 |t| &mut t.border)?,
-            "8" => pick_and_save(ui, storage_dir, config, depth, "System message color",
-                                 |t| &mut t.system_text)?,
+            "1" => pick_and_save(ui, storage_dir, prefs, identity_name, identity, depth,
+                                 "Timestamp color", |t| &mut t.timestamp)?,
+            "2" => pick_and_save(ui, storage_dir, prefs, identity_name, identity, depth,
+                                 "Your ID color", |t| &mut t.own_id)?,
+            "3" => pick_and_save(ui, storage_dir, prefs, identity_name, identity, depth,
+                                 "Your text color", |t| &mut t.own_text)?,
+            "4" => pick_and_save(ui, storage_dir, prefs, identity_name, identity, depth,
+                                 "Peer name color", |t| &mut t.peer_id)?,
+            "5" => pick_and_save(ui, storage_dir, prefs, identity_name, identity, depth,
+                                 "Peer text color", |t| &mut t.peer_text)?,
+            "6" => pick_and_save(ui, storage_dir, prefs, identity_name, identity, depth,
+                                 "Background color", |t| &mut t.background)?,
+            "7" => pick_and_save(ui, storage_dir, prefs, identity_name, identity, depth,
+                                 "Border color", |t| &mut t.border)?,
+            "8" => pick_and_save(ui, storage_dir, prefs, identity_name, identity, depth,
+                                 "System message color", |t| &mut t.system_text)?,
 
-            "s" => save_theme(ui, storage_dir, config)?,
-            "l" if !config.saved_themes.is_empty() => load_theme(ui, storage_dir, config)?,
-            "x" if !config.saved_themes.is_empty() => delete_theme(ui, storage_dir, config)?,
+            "s" => save_theme(ui, storage_dir, prefs, identity_name, identity)?,
+            "l" if !prefs.saved_themes.is_empty() => load_theme(ui, storage_dir, prefs, identity_name, identity)?,
+            "x" if !prefs.saved_themes.is_empty() => delete_theme(ui, storage_dir, prefs, identity_name, identity)?,
             "r" => {
-                config.chat_theme = ChatTheme::default();
-                persistence::save_config(storage_dir, config)
-                    .with_context(|| "Failed to save config")?;
+                prefs.chat_theme = ChatTheme::default();
+                persistence::save_identity_prefs(storage_dir, identity_name, prefs, identity)
+                    .with_context(|| "Failed to save prefs")?;
                 ui.success("Theme reset to defaults.")?;
                 ui.wait_for_key("Press any key...")?;
             }
@@ -159,20 +172,21 @@ fn theme_editor(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<(
     }
 }
 
-/// Open the color picker for one theme field, save on change.
 fn pick_and_save(
-    ui:          &Ui,
-    storage_dir: &Path,
-    config:      &mut AppConfig,
-    depth:       ColorDepth,
-    label:       &str,
-    field:       impl Fn(&mut ChatTheme) -> &mut ThemeColor,
+    ui:            &Ui,
+    storage_dir:   &Path,
+    prefs:         &mut IdentityPrefs,
+    identity_name: &str,
+    identity:      &PgpIdentity,
+    depth:         ColorDepth,
+    label:         &str,
+    field:         impl Fn(&mut ChatTheme) -> &mut ThemeColor,
 ) -> Result<()> {
-    let current = *field(&mut config.chat_theme);
+    let current = *field(&mut prefs.chat_theme);
     let chosen  = pick_color(ui, label, current, depth)?;
-    *field(&mut config.chat_theme) = chosen;
-    persistence::save_config(storage_dir, config)
-        .with_context(|| "Failed to save config")
+    *field(&mut prefs.chat_theme) = chosen;
+    persistence::save_identity_prefs(storage_dir, identity_name, prefs, identity)
+        .with_context(|| "Failed to save prefs")
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +205,6 @@ fn pick_color(ui: &Ui, label: &str, current: ThemeColor, depth: ColorDepth) -> R
         let marker = if c == current { " ◀" } else { "" };
         let col    = tc_to_color(c, depth);
         queue!(out, Print(format!("  [{:>2}] ", i + 1)))?;
-        // Black needs a white background so the swatch blocks are visible.
         if c == ThemeColor::Black {
             queue!(
                 out,
@@ -229,29 +242,41 @@ fn pick_color(ui: &Ui, label: &str, current: ThemeColor, depth: ColorDepth) -> R
 // Save / load / delete named themes
 // ---------------------------------------------------------------------------
 
-fn save_theme(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<()> {
+fn save_theme(
+    ui:            &Ui,
+    storage_dir:   &Path,
+    prefs:         &mut IdentityPrefs,
+    identity_name: &str,
+    identity:      &PgpIdentity,
+) -> Result<()> {
     let name = ui.prompt("Theme name (Enter to cancel):")?;
     let name = name.trim().to_string();
     if name.is_empty() {
         return Ok(());
     }
-    config.chat_theme.name = name.clone();
-    if let Some(pos) = config.saved_themes.iter().position(|t| t.name == name) {
-        config.saved_themes[pos] = config.chat_theme.clone();
+    prefs.chat_theme.name = name.clone();
+    if let Some(pos) = prefs.saved_themes.iter().position(|t| t.name == name) {
+        prefs.saved_themes[pos] = prefs.chat_theme.clone();
         ui.success(&format!("Theme '{}' updated.", name))?;
     } else {
-        config.saved_themes.push(config.chat_theme.clone());
+        prefs.saved_themes.push(prefs.chat_theme.clone());
         ui.success(&format!("Theme '{}' saved.", name))?;
     }
-    persistence::save_config(storage_dir, config)
-        .with_context(|| "Failed to save config")?;
+    persistence::save_identity_prefs(storage_dir, identity_name, prefs, identity)
+        .with_context(|| "Failed to save prefs")?;
     ui.wait_for_key("Press any key...")?;
     Ok(())
 }
 
-fn load_theme(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<()> {
+fn load_theme(
+    ui:            &Ui,
+    storage_dir:   &Path,
+    prefs:         &mut IdentityPrefs,
+    identity_name: &str,
+    identity:      &PgpIdentity,
+) -> Result<()> {
     println!("\r");
-    for (i, t) in config.saved_themes.iter().enumerate() {
+    for (i, t) in prefs.saved_themes.iter().enumerate() {
         println!("  [{}] {}\r", i + 1, t.name);
     }
     println!("  [0] Cancel\r");
@@ -263,11 +288,11 @@ fn load_theme(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<()>
         return Ok(());
     }
     if let Ok(n) = choice.parse::<usize>() {
-        if n >= 1 && n <= config.saved_themes.len() {
-            config.chat_theme = config.saved_themes[n - 1].clone();
-            persistence::save_config(storage_dir, config)
-                .with_context(|| "Failed to save config")?;
-            ui.success(&format!("Loaded theme '{}'.", config.chat_theme.name))?;
+        if n >= 1 && n <= prefs.saved_themes.len() {
+            prefs.chat_theme = prefs.saved_themes[n - 1].clone();
+            persistence::save_identity_prefs(storage_dir, identity_name, prefs, identity)
+                .with_context(|| "Failed to save prefs")?;
+            ui.success(&format!("Loaded theme '{}'.", prefs.chat_theme.name))?;
             ui.wait_for_key("Press any key...")?;
             return Ok(());
         }
@@ -277,9 +302,15 @@ fn load_theme(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<()>
     Ok(())
 }
 
-fn delete_theme(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<()> {
+fn delete_theme(
+    ui:            &Ui,
+    storage_dir:   &Path,
+    prefs:         &mut IdentityPrefs,
+    identity_name: &str,
+    identity:      &PgpIdentity,
+) -> Result<()> {
     println!("\r");
-    for (i, t) in config.saved_themes.iter().enumerate() {
+    for (i, t) in prefs.saved_themes.iter().enumerate() {
         println!("  [{}] {}\r", i + 1, t.name);
     }
     println!("  [0] Cancel\r");
@@ -291,10 +322,10 @@ fn delete_theme(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<(
         return Ok(());
     }
     if let Ok(n) = choice.parse::<usize>() {
-        if n >= 1 && n <= config.saved_themes.len() {
-            let name = config.saved_themes.remove(n - 1).name;
-            persistence::save_config(storage_dir, config)
-                .with_context(|| "Failed to save config")?;
+        if n >= 1 && n <= prefs.saved_themes.len() {
+            let name = prefs.saved_themes.remove(n - 1).name;
+            persistence::save_identity_prefs(storage_dir, identity_name, prefs, identity)
+                .with_context(|| "Failed to save prefs")?;
             ui.success(&format!("Deleted theme '{}'.", name))?;
             ui.wait_for_key("Press any key...")?;
             return Ok(());
@@ -309,8 +340,6 @@ fn delete_theme(ui: &Ui, storage_dir: &Path, config: &mut AppConfig) -> Result<(
 // Display helpers
 // ---------------------------------------------------------------------------
 
-/// Print one theme element row with a color swatch.
-/// `note_default` appends "(rotating colors)" or "(transparent)" for Default-special fields.
 fn print_theme_row(depth: ColorDepth, label: &str, color: ThemeColor, note_default: bool) {
     let mut out = stdout();
     let col  = tc_to_color(color, depth);
@@ -320,7 +349,6 @@ fn print_theme_row(depth: ColorDepth, label: &str, color: ThemeColor, note_defau
         ""
     };
     let _ = queue!(out, Print(format!("{}:  ", label)));
-    // Black swatch needs a white background to be visible against dark terminals.
     if color == ThemeColor::Black {
         let _ = queue!(
             out,
@@ -337,24 +365,21 @@ fn print_theme_row(depth: ColorDepth, label: &str, color: ThemeColor, note_defau
     let _ = out.flush();
 }
 
-/// Render a two-line sample showing what chat messages look like with this theme.
 fn print_preview(depth: ColorDepth, theme: &ChatTheme) {
     let mut out = stdout();
     let ts_col   = tc_to_color(theme.timestamp,  depth);
     let own_id   = tc_to_color(theme.own_id,     depth);
     let own_txt  = tc_to_color(theme.own_text,   depth);
     let peer_id  = if theme.peer_id == ThemeColor::Default {
-        Color::Green // show one representative rotation color
+        Color::Green
     } else {
         tc_to_color(theme.peer_id, depth)
     };
     let peer_txt = tc_to_color(theme.peer_text,  depth);
     let sys_col  = tc_to_color(theme.system_text, depth);
     let bg       = tc_to_color(theme.background, depth);
+    let set_bg   = bg != Color::Reset;
 
-    let set_bg = bg != Color::Reset;
-
-    // Sent message row
     if set_bg { let _ = queue!(out, SetBackgroundColor(bg)); }
     let _ = queue!(
         out,
@@ -368,7 +393,6 @@ fn print_preview(depth: ColorDepth, theme: &ChatTheme) {
         ResetColor,                  Print("\r\n"),
     );
 
-    // Received message row
     if set_bg { let _ = queue!(out, SetBackgroundColor(bg)); }
     let _ = queue!(
         out,
@@ -382,7 +406,6 @@ fn print_preview(depth: ColorDepth, theme: &ChatTheme) {
         ResetColor,                   Print("\r\n"),
     );
 
-    // System message row
     let _ = queue!(
         out,
         SetForegroundColor(sys_col),
